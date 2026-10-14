@@ -1,6 +1,6 @@
 {
   "name": "@marl1w/scrypted-reolink",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Scrypted plugin that receives Reolink camera and NVR motion and AI events by Baichuan push (TCP 9000) over one connection per device, instead of polling the HTTP API.",
   "license": "Apache-2.0",
   "scripts": {

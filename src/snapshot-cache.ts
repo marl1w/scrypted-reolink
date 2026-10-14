@@ -99,7 +99,8 @@ process.once('exit', () => { for (const p of live) p.kill('SIGKILL'); });
 
 export interface KeyframeCacheOptions {
     ffmpegPath: () => Promise<string>;
-    url: () => string;
+    /** Where to read the stream; retryMs asks for another try later (e.g. a fallback source). */
+    source: () => Promise<{ url: string; label: string; retryMs?: number }>;
     log: (msg: string) => void;
     now?: () => number;
     restartMinMs?: number;
@@ -123,11 +124,13 @@ export class KeyframeCache {
     restarts = 0;
     private asm?: KeyframeAssembler;
     private lastError = '';
+    private retryTimer?: NodeJS.Timeout;
+    sourceLabel = '';
 
     /** Counters for the status line: stream bytes and NAL units parsed, and ffmpeg's last error. */
     diag(): string {
         const e = this.lastError.trim().split('\n').pop();
-        return `${Math.round((this.asm?.bytes ?? 0) / 1024)} KiB in · ${this.asm?.nals ?? 0} NALs${e ? ` · ffmpeg: ${e}` : ''}`;
+        return `from ${this.sourceLabel || '?'} · ${Math.round((this.asm?.bytes ?? 0) / 1024)} KiB in · ${this.asm?.nals ?? 0} NALs${e ? ` · ffmpeg: ${e}` : ''}`;
     }
 
     constructor(private o: KeyframeCacheOptions) {
@@ -145,6 +148,7 @@ export class KeyframeCache {
     stop() {
         this.stopped = true;
         clearTimeout(this.restartTimer);
+        clearTimeout(this.retryTimer);
         this.proc?.kill('SIGKILL');
         this.proc = undefined;
     }
@@ -220,12 +224,22 @@ export class KeyframeCache {
             return this.scheduleRestart();
         }
         if (this.stopped) return;
+        let src: { url: string; label: string; retryMs?: number };
+        try {
+            src = await this.o.source();
+        }
+        catch (e) {
+            this.o.log(`snapshot cache: no stream (${(e as Error).message})`);
+            return this.scheduleRestart();
+        }
+        if (this.stopped) return;
+        this.sourceLabel = src.label;
         // Copy only, no decoding; SPS/PPS repeated before every keyframe so each one decodes on its own.
         const args = [
             '-hide_banner', '-loglevel', 'error', '-nostdin',
             '-rtsp_transport', 'tcp', '-timeout', '10000000',
             '-fflags', 'nobuffer', '-flags', 'low_delay',
-            '-i', this.o.url(),
+            '-i', src.url,
             '-an', '-sn', '-dn',
             '-c:v', 'copy', '-bsf:v', 'dump_extra=freq=keyframe',
             '-flush_packets', '1',
@@ -233,6 +247,9 @@ export class KeyframeCache {
         ];
         const p = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         this.proc = p;
+        clearTimeout(this.retryTimer);
+        // A fallback source is given up after a while so the preferred one gets another chance.
+        if (src.retryMs) this.retryTimer = setTimeout(() => { if (this.proc === p) p.kill('SIGKILL'); }, src.retryMs);
         live.add(p);
         const asm = new KeyframeAssembler();
         this.asm = asm;

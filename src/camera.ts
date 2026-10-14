@@ -68,19 +68,42 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         });
         this.snapshots = new KeyframeCache({
             ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
-            url: () => this.snapshotStreamUrl(),
+            source: () => this.snapshotSource(),
             log: m => this.console.warn(m),
         });
         if (this.storageSettings.values.snapshotCache) this.snapshots.start();
     }
 
     /** The lowest-resolution RTSP stream: keyframes are cheap to decode and match what HomeKit shows. */
-    private snapshotStreamUrl(): string {
+    private snapshotStream(): StreamOption {
         const rtsp = this.streams().filter(s => s.container === 'rtsp' && s.url);
         rtsp.sort((a, b) => (a.video?.width ?? 1e9) - (b.video?.width ?? 1e9));
         const s = rtsp.find(x => x.id.endsWith(`_${String(this.channel + 1).padStart(2, '0')}_sub`)) ?? rtsp[0];
         if (!s) throw new Error('no RTSP stream');
-        return addStreamCredentials(s.url, this.nvr.username, this.nvr.password);
+        return s;
+    }
+
+    /**
+     * Prefer Scrypted's local rebroadcast of the substream (the prebuffer already holds the one NVR connection),
+     * asked for through the device's mixins; fall back to the NVR itself and retry the rebroadcast later.
+     */
+    private async snapshotSource(): Promise<{ url: string; label: string; retryMs?: number }> {
+        const s = this.snapshotStream();
+        try {
+            const dev = sdk.systemManager.getDeviceById<VideoCamera>(this.id);
+            const mo = await Promise.race([
+                dev.getVideoStream({ id: s.id, prebuffer: 0, destination: 'local' } as RequestMediaStreamOptions),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+            ]);
+            const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
+            const url = String(ff?.url || '');
+            if (/^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(url))
+                return { url, label: 'rebroadcast' };
+        }
+        catch (e) {
+            this.console.warn(`snapshot cache: rebroadcast unavailable (${(e as Error).message}), reading the NVR`);
+        }
+        return { url: addStreamCredentials(s.url, this.nvr.username, this.nvr.password), label: 'nvr', retryMs: 60000 };
     }
 
     onPush(ev: PushEvent) {

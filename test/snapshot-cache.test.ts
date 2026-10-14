@@ -24,7 +24,7 @@ test('a keyframe without in-band SPS/PPS gets the latest ones', () => {
     assert.deepEqual(nalTypes(out[1]), [7, 8, 5]);
 });
 
-const mk = (now: () => number) => new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, url: () => '', log: () => { }, now, restartMinMs: 1e6 });
+const mk = (now: () => number) => new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, source: async () => ({ url: '', label: 'test' }), log: () => { }, now, restartMinMs: 1e6 });
 
 test('only keyframes are kept; a just-arrived one is reused, else the next one is awaited', async () => {
     let now = 0;
