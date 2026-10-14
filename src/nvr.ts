@@ -91,7 +91,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         await Promise.all([p?.stop(), s?.stop()]);
     }
 
-    private async restart() {
+    async restart() {
         await this.stop();
         this.start();
     }

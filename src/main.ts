@@ -25,15 +25,17 @@ class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
         const nativeId = `nvr-${randomBytes(4).toString('hex')}`;
-        const storage = sdk.deviceManager.getDeviceStorage(nativeId);
-        for (const k of ['host', 'username', 'password'])
-            if (settings[k] !== undefined) storage.setItem(k, String(settings[k]));
+        // Device storage exists only once the device is discovered, so store the settings afterwards.
         await sdk.deviceManager.onDeviceDiscovered({
             nativeId,
             name: String(settings.name || 'Reolink NVR'),
             type: ScryptedDeviceType.API,
             interfaces: [ScryptedInterface.DeviceProvider, ScryptedInterface.Settings, ScryptedInterface.Online],
         });
+        const nvr = await this.getDevice(nativeId) as ReolinkNvr;
+        for (const k of ['host', 'username', 'password'])
+            if (settings[k] !== undefined) nvr.storage.setItem(k, String(settings[k]));
+        await nvr.restart();
         return nativeId;
     }
 
