@@ -130,6 +130,8 @@ export class KeyframeCache {
             '-an', '-sn', '-dn',
             '-fps_mode', 'passthrough',
             '-c:v', 'mjpeg', '-q:v', '4',
+            // Without it the pipe holds the tail of each JPEG until the next keyframe pushes it out.
+            '-flush_packets', '1',
             '-f', 'image2pipe', 'pipe:1',
         ];
         const p = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
