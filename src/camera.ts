@@ -2,8 +2,12 @@ import sdk, { Camera, DeviceProvider, MediaObject, MediaStreamUrl, MotionSensor,
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
+import { KeyframeCache } from './snapshot-cache';
 import { addStreamCredentials, buildStreamOptions, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
+
+const SNAPSHOT_MAX_AGE_MS = 2500;
+const SNAPSHOT_WAIT_MS = 1500;
 
 export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, ObjectDetector, Settings, Online, DeviceProvider {
     storageSettings = new StorageSettings(this, {
@@ -25,6 +29,13 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             type: 'number',
             defaultValue: 0,
         },
+        snapshotCache: {
+            title: 'Snapshot Cache',
+            description: 'Keep the latest keyframe of the low-resolution stream decoded, so snapshots return at once. Off falls back to the NVR snapshot API.',
+            type: 'boolean',
+            defaultValue: false,
+            onPut: (_o, v) => v ? this.snapshots.start() : this.snapshots.stop(),
+        },
         dayNight: {
             title: 'Day/Night',
             readonly: true,
@@ -33,6 +44,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     });
 
     readonly motion: MotionController;
+    readonly snapshots: KeyframeCache;
     private children = new Map<string, ScryptedDeviceBase>();
 
     constructor(nativeId: string, readonly nvr: ReolinkNvr, readonly channel: number) {
@@ -54,6 +66,21 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             },
             dayNight: mode => { this.storageSettings.values.dayNight = mode; },
         });
+        this.snapshots = new KeyframeCache({
+            ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
+            url: () => this.snapshotStreamUrl(),
+            log: m => this.console.warn(m),
+        });
+        if (this.storageSettings.values.snapshotCache) this.snapshots.start();
+    }
+
+    /** The lowest-resolution RTSP stream: keyframes are cheap to decode and match what HomeKit shows. */
+    private snapshotStreamUrl(): string {
+        const rtsp = this.streams().filter(s => s.container === 'rtsp' && s.url);
+        rtsp.sort((a, b) => (a.video?.width ?? 1e9) - (b.video?.width ?? 1e9));
+        const s = rtsp.find(x => x.id.endsWith(`_${String(this.channel + 1).padStart(2, '0')}_sub`)) ?? rtsp[0];
+        if (!s) throw new Error('no RTSP stream');
+        return addStreamCredentials(s.url, this.nvr.username, this.nvr.password);
     }
 
     onPush(ev: PushEvent) {
@@ -89,7 +116,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        const jpeg = await this.nvr.snapshot(this.channel, options?.timeout);
+        // Fresh cached keyframe first; while the cache warms up, wait briefly for the next one; then the NVR.
+        let jpeg = this.snapshots.running ? await this.snapshots.get(SNAPSHOT_MAX_AGE_MS, SNAPSHOT_WAIT_MS) : undefined;
+        if (!jpeg) jpeg = await this.nvr.snapshot(this.channel, options?.timeout);
         return sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 
@@ -110,7 +139,14 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         return [
             ...await this.storageSettings.getSettings(),
             { key: 'info', title: 'Channel', readonly: true, value: `NVR channel ${this.channel} · ${c?.model ?? 'unknown model'} · ${c?.online === false ? 'offline' : 'online'}` },
+            { key: 'snapshotInfo', title: 'Snapshot Cache Status', readonly: true, value: this.snapshotStatus() },
         ];
+    }
+
+    private snapshotStatus(): string {
+        if (!this.snapshots.running) return 'off';
+        const age = this.snapshots.age();
+        return `${age === undefined ? 'no image yet' : `latest ${(age / 1000).toFixed(1)} s old`} · ${this.snapshots.frames} frames · ${this.snapshots.restarts} restarts`;
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
@@ -133,6 +169,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     dispose() {
         this.motion.dispose();
+        this.snapshots.stop();
     }
 }
 
