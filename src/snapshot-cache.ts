@@ -111,8 +111,13 @@ export class KeyframeCache {
     /** A JPEG of the next keyframe (or one at most reuseMs old), or undefined when none arrives in waitMs. */
     async snapshot(reuseMs: number, waitMs: number): Promise<Buffer | undefined> {
         const au = await this.keyframe(reuseMs, waitMs);
-        return au && this.decode(au);
+        if (!au) return undefined;
+        // Concurrent requests for the same keyframe share one decode.
+        if (this.decoding?.au !== au) this.decoding = { au, jpeg: this.decode(au) };
+        return this.decoding.jpeg;
     }
+
+    private decoding?: { au: Buffer; jpeg: Promise<Buffer | undefined> };
 
     /** Feed one access unit (used by the stream reader and by tests); only keyframes are kept. */
     accept(au: Buffer) {
