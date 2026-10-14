@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<DeviceInfo version="1.1">
+<firmVersion>00000000000000</firmVersion>
+<IOInputPortNum>0</IOInputPortNum>
+<IOOutputPortNum>0</IOOutputPortNum>
+<diskNum>1</diskNum>
+<type>nvr</type>
+<channelNum>12</channelNum>
+<audioNum>0</audioNum>
+<ipChannel>12</ipChannel>
+<analogChnNum>0</analogChnNum>
+<resolution>
+<resolutionName>3840*2160</resolutionName>
+<width>3840</width>
+<height>2160</height>
+</resolution>
+<language>English</language>
+<sdCard>0</sdCard>
+<ptzMode>none</ptzMode>
+<typeInfo>NVR</typeInfo>
+<softVer>0</softVer>
+<B485>0</B485>
+<supportAutoUpdate>0</supportAutoUpdate>
+<userVer>1</userVer>
+</DeviceInfo>
+<StreamInfoList version="1.1">
+</StreamInfoList>
+</body>

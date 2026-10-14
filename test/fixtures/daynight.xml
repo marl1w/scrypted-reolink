@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<AlarmEventList version="1.1">
+<DayNightEvent version="1.1">
+<channelId>5</channelId>
+<mode>night</mode>
+</DayNightEvent>
+<AlarmEvent version="1.1">
+<channelId>5</channelId>
+<status>MD</status>
+<AItype>none</AItype>
+</AlarmEvent>
+</AlarmEventList>
+</body>

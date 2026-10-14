@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<AlarmEventList version="1.1">
+<AlarmEvent version="1.1">
+<channelId>0</channelId>
+<status>MD</status>
+<recording>1</recording>
+<timeStamp>0</timeStamp>
+<AItype>people,vehicle</AItype>
+</AlarmEvent>
+<AlarmEvent version="1.1">
+<channelId>3</channelId>
+<status>none</status>
+<recording>0</recording>
+<timeStamp>0</timeStamp>
+<AItype>none</AItype>
+</AlarmEvent>
+<AlarmEvent version="1.1">
+<channelId>11</channelId>
+<status>MD,visitor</status>
+<recording>1</recording>
+<timeStamp>1791886000</timeStamp>
+<AItype>dog_cat,face,package</AItype>
+<smartAiTypeList>
+<smartAiType>
+<type>crossline</type>
+<index>1</index>
+</smartAiType>
+</smartAiTypeList>
+</AlarmEvent>
+</AlarmEventList>
+</body>
