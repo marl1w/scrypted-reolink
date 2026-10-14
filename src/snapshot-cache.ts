@@ -1,36 +1,46 @@
 import { ChildProcess, spawn } from 'node:child_process';
 
-/** Splits a stream of concatenated JPEGs (ffmpeg image2pipe) into whole images. */
-export class JpegSplitter {
+const AUD = Buffer.from([0x00, 0x00, 0x01, 0x09]);
+const MAX_PENDING = 4 * 1024 * 1024;
+
+/** NAL unit types (H.264) present in an Annex B access unit. */
+export function nalTypes(au: Buffer): number[] {
+    const out: number[] = [];
+    for (let i = 0; i + 3 < au.length; i++) {
+        if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1) {
+            out.push(au[i + 3] & 0x1f);
+            i += 3;
+        }
+    }
+    return out;
+}
+
+/**
+ * Splits an Annex B H.264 stream with access unit delimiters into access units.
+ * Emulation prevention guarantees 00 00 01 never occurs inside a NAL, so every AUD start code is a boundary.
+ */
+export class AccessUnitSplitter {
     private buf: Buffer = Buffer.alloc(0);
 
     push(chunk: Buffer): Buffer[] {
         this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
         const out: Buffer[] = [];
-        for (;;) {
-            const start = this.buf.indexOf(SOI);
-            if (start < 0) {
-                // Keep a trailing 0xFF: it may be the first byte of the next SOI.
-                this.buf = this.buf.length && this.buf[this.buf.length - 1] === 0xff ? this.buf.subarray(-1) : Buffer.alloc(0);
-                break;
-            }
-            // Entropy-coded data stuffs 0xFF bytes, so the first EOI after SOI ends the image.
-            const end = this.buf.indexOf(EOI, start + 2);
-            if (end < 0) {
-                this.buf = this.buf.subarray(start);
-                break;
-            }
-            out.push(Buffer.from(this.buf.subarray(start, end + 2)));
-            this.buf = this.buf.subarray(end + 2);
+        let start = this.buf.indexOf(AUD);
+        if (start < 0) {
+            if (this.buf.length > MAX_PENDING) this.buf = Buffer.alloc(0);
+            return out;
         }
+        for (;;) {
+            const next = this.buf.indexOf(AUD, start + AUD.length);
+            if (next < 0) break;
+            out.push(Buffer.from(this.buf.subarray(start, next)));
+            start = next;
+        }
+        this.buf = this.buf.subarray(start);
         if (this.buf.length > MAX_PENDING) this.buf = Buffer.alloc(0);
         return out;
     }
 }
-
-const SOI = Buffer.from([0xff, 0xd8]);
-const EOI = Buffer.from([0xff, 0xd9]);
-const MAX_PENDING = 4 * 1024 * 1024;
 
 // ffmpeg children must not outlive the plugin process (a reload would leave them streaming).
 const live = new Set<ChildProcess>();
@@ -46,17 +56,19 @@ export interface KeyframeCacheOptions {
 }
 
 /**
- * Keeps the latest keyframe of a low-resolution stream decoded as JPEG, so a snapshot is served from memory
- * instead of waiting for the next keyframe. ffmpeg decodes keyframes only, which keeps the cost small.
+ * Snapshots the way go2rtc takes them: the low-resolution stream stays open without decoding, and a request
+ * decodes exactly one keyframe in a short-lived ffmpeg. Ending the decoder's input after that single frame
+ * flushes it at once, so the image is as new as the keyframe (a long-running decoder fed keyframes only
+ * holds several of them back in its reorder buffer, seconds behind).
  */
 export class KeyframeCache {
     private proc?: ChildProcess;
-    private latest?: { jpeg: Buffer; at: number };
-    private waiters: ((jpeg: Buffer) => void)[] = [];
+    private latest?: { au: Buffer; at: number };
+    private waiters: ((au?: Buffer) => void)[] = [];
     private stopped = true;
     private restartTimer?: NodeJS.Timeout;
     private backoff: number;
-    frames = 0;
+    keyframes = 0;
     restarts = 0;
 
     constructor(private o: KeyframeCacheOptions) {
@@ -80,31 +92,57 @@ export class KeyframeCache {
 
     get running() { return !this.stopped; }
 
-    /** Age in ms of the newest cached image, or undefined when there is none. */
+    /** Age in ms of the newest keyframe, or undefined when there is none. */
     age(): number | undefined {
         return this.latest ? this.now() - this.latest.at : undefined;
     }
 
-    /** The newest image if it is younger than maxAgeMs, else the next one to arrive within waitMs. */
-    async get(maxAgeMs: number, waitMs: number): Promise<Buffer | undefined> {
-        if (this.latest && this.now() - this.latest.at <= maxAgeMs) return this.latest.jpeg;
+    /** The newest keyframe if it is at most reuseMs old, else the next one to arrive within waitMs. */
+    async keyframe(reuseMs: number, waitMs: number): Promise<Buffer | undefined> {
+        if (this.latest && this.now() - this.latest.at <= reuseMs) return this.latest.au;
         if (this.stopped || waitMs <= 0) return undefined;
         return new Promise(resolve => {
-            const done = (j?: Buffer) => { clearTimeout(t); this.waiters = this.waiters.filter(w => w !== w2); resolve(j); };
-            const w2 = (j: Buffer) => done(j);
-            const t = setTimeout(() => done(undefined), waitMs);
-            this.waiters.push(w2);
+            const w = (au?: Buffer) => { clearTimeout(t); this.waiters = this.waiters.filter(x => x !== w); resolve(au); };
+            const t = setTimeout(() => w(undefined), waitMs);
+            this.waiters.push(w);
         });
     }
 
-    /** Feed one decoded image (used by the ffmpeg reader and by tests). */
-    accept(jpeg: Buffer) {
-        this.latest = { jpeg, at: this.now() };
-        this.frames++;
+    /** A JPEG of the next keyframe (or one at most reuseMs old), or undefined when none arrives in waitMs. */
+    async snapshot(reuseMs: number, waitMs: number): Promise<Buffer | undefined> {
+        const au = await this.keyframe(reuseMs, waitMs);
+        return au && this.decode(au);
+    }
+
+    /** Feed one access unit (used by the stream reader and by tests); only keyframes are kept. */
+    accept(au: Buffer) {
+        if (!nalTypes(au).includes(5)) return;
+        this.latest = { au, at: this.now() };
+        this.keyframes++;
         this.backoff = this.o.restartMinMs ?? 2000;
         const w = this.waiters;
         this.waiters = [];
-        for (const f of w) f(jpeg);
+        for (const f of w) f(au);
+    }
+
+    private async decode(au: Buffer): Promise<Buffer | undefined> {
+        const ffmpeg = await this.o.ffmpegPath();
+        return new Promise(resolve => {
+            const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'h264', '-i', 'pipe:0',
+                '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2pipe', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+            live.add(p);
+            const chunks: Buffer[] = [];
+            const t = setTimeout(() => p.kill('SIGKILL'), 3000);
+            p.stdout!.on('data', (c: Buffer) => chunks.push(c));
+            p.on('exit', () => {
+                clearTimeout(t);
+                live.delete(p);
+                const jpeg = Buffer.concat(chunks);
+                resolve(jpeg.length > 2 && jpeg[0] === 0xff && jpeg[1] === 0xd8 ? jpeg : undefined);
+            });
+            p.stdin!.on('error', () => { });
+            p.stdin!.end(au);
+        });
     }
 
     private async spawn() {
@@ -118,27 +156,23 @@ export class KeyframeCache {
             return this.scheduleRestart();
         }
         if (this.stopped) return;
+        // Copy only, no decoding: SPS/PPS repeated before every keyframe and an AUD before every access unit,
+        // so each keyframe can be cut out and decoded on its own.
         const args = [
             '-hide_banner', '-loglevel', 'error', '-nostdin',
             '-rtsp_transport', 'tcp', '-timeout', '10000000',
-            // Low latency: frame-threaded decoding holds back one frame per thread, which with keyframes
-            // only (about 1 s apart) delays every image by seconds; demuxer buffering adds more.
-            '-fflags', 'nobuffer', '-flags', 'low_delay', '-max_delay', '0',
-            '-probesize', '32768', '-analyzeduration', '0',
-            '-threads', '1', '-skip_frame', 'nokey',
+            '-fflags', 'nobuffer', '-flags', 'low_delay',
             '-i', this.o.url(),
             '-an', '-sn', '-dn',
-            '-fps_mode', 'passthrough',
-            '-c:v', 'mjpeg', '-q:v', '4',
-            // Without it the pipe holds the tail of each JPEG until the next keyframe pushes it out.
+            '-c:v', 'copy', '-bsf:v', 'dump_extra=freq=keyframe,h264_metadata=aud=insert',
             '-flush_packets', '1',
-            '-f', 'image2pipe', 'pipe:1',
+            '-f', 'h264', 'pipe:1',
         ];
         const p = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         this.proc = p;
         live.add(p);
-        const splitter = new JpegSplitter();
-        p.stdout!.on('data', (c: Buffer) => { for (const j of splitter.push(c)) this.accept(j); });
+        const splitter = new AccessUnitSplitter();
+        p.stdout!.on('data', (c: Buffer) => { for (const au of splitter.push(c)) this.accept(au); });
         let err = '';
         p.stderr!.on('data', (c: Buffer) => { err = (err + c.toString()).slice(-500); });
         p.on('exit', code => {

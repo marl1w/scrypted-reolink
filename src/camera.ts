@@ -6,7 +6,7 @@ import { KeyframeCache } from './snapshot-cache';
 import { addStreamCredentials, buildStreamOptions, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 
-const SNAPSHOT_MAX_AGE_MS = 2500;
+const SNAPSHOT_REUSE_MS = 300;
 const SNAPSHOT_WAIT_MS = 1500;
 
 export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, ObjectDetector, Settings, Online, DeviceProvider {
@@ -31,7 +31,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         },
         snapshotCache: {
             title: 'Snapshot Cache',
-            description: 'Keep the latest keyframe of the low-resolution stream decoded, so snapshots return at once. Off falls back to the NVR snapshot API.',
+            description: 'Keep the low-resolution stream open and decode the next keyframe on request, as go2rtc does. Off uses the NVR snapshot API.',
             type: 'boolean',
             defaultValue: false,
             onPut: (_o, v) => v ? this.snapshots.start() : this.snapshots.stop(),
@@ -116,8 +116,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        // Fresh cached keyframe first; while the cache warms up, wait briefly for the next one; then the NVR.
-        let jpeg = this.snapshots.running ? await this.snapshots.get(SNAPSHOT_MAX_AGE_MS, SNAPSHOT_WAIT_MS) : undefined;
+        // As go2rtc does: decode the next keyframe (or one that just arrived); the NVR snapshot API is the fallback.
+        let jpeg = this.snapshots.running ? await this.snapshots.snapshot(SNAPSHOT_REUSE_MS, SNAPSHOT_WAIT_MS).catch(() => undefined) : undefined;
         if (!jpeg) jpeg = await this.nvr.snapshot(this.channel, options?.timeout);
         return sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
@@ -146,7 +146,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     private snapshotStatus(): string {
         if (!this.snapshots.running) return 'off';
         const age = this.snapshots.age();
-        return `${age === undefined ? 'no image yet' : `latest ${(age / 1000).toFixed(1)} s old`} · ${this.snapshots.frames} frames · ${this.snapshots.restarts} restarts`;
+        return `${age === undefined ? 'no image yet' : `last keyframe ${(age / 1000).toFixed(1)} s ago`} · ${this.snapshots.keyframes} keyframes · ${this.snapshots.restarts} restarts`;
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {

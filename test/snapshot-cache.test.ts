@@ -1,38 +1,48 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { JpegSplitter, KeyframeCache } from '../src/snapshot-cache';
+import { AccessUnitSplitter, KeyframeCache, nalTypes } from '../src/snapshot-cache';
 
-const jpeg = (n: number) => Buffer.from([0xff, 0xd8, n, 0xff, 0x00, n, 0xff, 0xd9]);
+const nal = (type: number, n: number) => Buffer.from([0, 0, 0, 1, type, n, n]);
+const au = (...types: number[]) => Buffer.concat([Buffer.from([0, 0, 0, 1, 0x09, 0xf0]), ...types.map(t => nal(t, t))]);
+const key = au(0x67, 0x68, 0x65);
+const delta = au(0x41);
 
-test('splitter returns whole images across chunk boundaries and drops leading junk', () => {
-    const s = new JpegSplitter();
-    const all = Buffer.concat([Buffer.from([1, 2, 3]), jpeg(1), jpeg(2), jpeg(3)]);
+test('splitter cuts access units at each delimiter across chunk boundaries', () => {
+    const s = new AccessUnitSplitter();
+    const all = Buffer.concat([Buffer.from([7, 7]), key, delta, delta, key]);
     const out: Buffer[] = [];
-    for (let i = 0; i < all.length; i += 3) out.push(...s.push(all.subarray(i, i + 3)));
-    assert.deepEqual(out, [jpeg(1), jpeg(2), jpeg(3)]);
+    for (let i = 0; i < all.length; i += 5) out.push(...s.push(all.subarray(i, i + 5)));
+    // The last unit stays pending until the next delimiter proves it complete.
+    assert.equal(out.length, 3);
+    assert.deepEqual(nalTypes(out[0]), [9, 7, 8, 5]);
+    assert.deepEqual(nalTypes(out[1]), [9, 1]);
 });
 
-test('cache serves a fresh image at once, and waits for the next one when stale', async () => {
+const mk = (now: () => number) => new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, url: () => '', log: () => { }, now, restartMinMs: 1e6 });
+
+test('only keyframes are kept; a just-arrived one is reused, else the next one is awaited', async () => {
     let now = 0;
-    const c = new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, url: () => '', log: () => { }, now: () => now, restartMinMs: 1e6 });
+    const c = mk(() => now);
     c.start();
-    c.accept(jpeg(1));
-    now = 1000;
-    assert.deepEqual(await c.get(2500, 0), jpeg(1));
-    now = 5000;
-    assert.equal(await c.get(2500, 0), undefined);
-    const p = c.get(2500, 1000);
-    c.accept(jpeg(2));
-    assert.deepEqual(await p, jpeg(2));
-    assert.equal(await c.get(2500, 20).then(() => 'fresh'), 'fresh');
+    c.accept(delta);
+    assert.equal(c.keyframes, 0);
+    c.accept(key);
+    now = 200;
+    assert.equal(await c.keyframe(300, 0), key);
+    now = 900;
+    assert.equal(await c.keyframe(300, 0), undefined);
+    const p = c.keyframe(300, 1000);
+    c.accept(delta);
+    const key2 = au(0x67, 0x68, 0x65, 0x65);
+    c.accept(key2);
+    assert.equal(await p, key2);
     c.stop();
 });
 
-test('a stale cache times out to undefined so the caller can fall back', async () => {
-    let now = 0;
-    const c = new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, url: () => '', log: () => { }, now: () => now, restartMinMs: 1e6 });
+test('no keyframe in time resolves undefined so the caller can fall back', async () => {
+    const c = mk(() => 0);
     c.start();
-    assert.equal(await c.get(2500, 30), undefined);
+    assert.equal(await c.keyframe(300, 30), undefined);
     c.stop();
-    assert.equal(await c.get(2500, 30), undefined);
+    assert.equal(await c.keyframe(300, 30), undefined);
 });
