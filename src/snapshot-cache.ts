@@ -1,9 +1,10 @@
 import { ChildProcess, spawn } from 'node:child_process';
 
-const AUD = Buffer.from([0x00, 0x00, 0x01, 0x09]);
+const SC = Buffer.from([0x00, 0x00, 0x01]);
+const SC4 = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 const MAX_PENDING = 4 * 1024 * 1024;
 
-/** NAL unit types (H.264) present in an Annex B access unit. */
+/** NAL unit types (H.264) present in an Annex B buffer. */
 export function nalTypes(au: Buffer): number[] {
     const out: number[] = [];
     for (let i = 0; i + 3 < au.length; i++) {
@@ -16,29 +17,79 @@ export function nalTypes(au: Buffer): number[] {
 }
 
 /**
- * Splits an Annex B H.264 stream with access unit delimiters into access units.
- * Emulation prevention guarantees 00 00 01 never occurs inside a NAL, so every AUD start code is a boundary.
+ * Cuts complete keyframes (SPS + PPS + IDR slices, Annex B) out of a raw H.264 stream. A keyframe is complete
+ * when the next frame's first NAL arrives. Emulation prevention guarantees 00 00 01 never occurs inside a NAL.
+ * The latest SPS/PPS are prepended when a keyframe arrives without them in-band.
  */
-export class AccessUnitSplitter {
+export class KeyframeAssembler {
     private buf: Buffer = Buffer.alloc(0);
+    private cur?: Buffer[];
+    private hasIdr = false;
+    private sps?: Buffer;
+    private pps?: Buffer;
+    bytes = 0;
+    nals = 0;
 
     push(chunk: Buffer): Buffer[] {
+        this.bytes += chunk.length;
         this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
         const out: Buffer[] = [];
-        let start = this.buf.indexOf(AUD);
+        let start = this.buf.indexOf(SC);
         if (start < 0) {
             if (this.buf.length > MAX_PENDING) this.buf = Buffer.alloc(0);
             return out;
         }
         for (;;) {
-            const next = this.buf.indexOf(AUD, start + AUD.length);
+            const next = this.buf.indexOf(SC, start + 3);
             if (next < 0) break;
-            out.push(Buffer.from(this.buf.subarray(start, next)));
+            // A 4-byte start code leaves its leading zero at the end of the previous NAL; trim it.
+            let end = next;
+            if (end > start + 3 && this.buf[end - 1] === 0) end--;
+            this.onNal(Buffer.concat([SC4, this.buf.subarray(start + 3, end)]), out);
             start = next;
         }
         this.buf = this.buf.subarray(start);
         if (this.buf.length > MAX_PENDING) this.buf = Buffer.alloc(0);
         return out;
+    }
+
+    private onNal(nal: Buffer, out: Buffer[]) {
+        if (nal.length <= 4) return;
+        this.nals++;
+        const t = nal[4] & 0x1f;
+        const finish = () => {
+            if (this.cur && this.hasIdr) out.push(Buffer.concat(this.cur));
+            this.cur = undefined;
+            this.hasIdr = false;
+        };
+        if (t === 7) {
+            finish();
+            this.sps = nal;
+            this.cur = [nal];
+        }
+        else if (t === 8) {
+            if (this.cur && this.hasIdr) finish();
+            this.pps = nal;
+            if (this.cur) this.cur.push(nal);
+        }
+        else if (t === 6) {
+            if (this.cur && this.hasIdr) finish();
+            if (this.cur) this.cur.push(nal);
+        }
+        else if (t === 5) {
+            if (!this.cur) {
+                if (!this.sps || !this.pps) return;
+                this.cur = [this.sps, this.pps];
+            }
+            else if (!this.cur.some(n => (n[4] & 0x1f) === 8) && this.pps) {
+                this.cur.push(this.pps);
+            }
+            this.cur.push(nal);
+            this.hasIdr = true;
+        }
+        else {
+            finish();
+        }
     }
 }
 
@@ -70,6 +121,14 @@ export class KeyframeCache {
     private backoff: number;
     keyframes = 0;
     restarts = 0;
+    private asm?: KeyframeAssembler;
+    private lastError = '';
+
+    /** Counters for the status line: stream bytes and NAL units parsed, and ffmpeg's last error. */
+    diag(): string {
+        const e = this.lastError.trim().split('\n').pop();
+        return `${Math.round((this.asm?.bytes ?? 0) / 1024)} KiB in · ${this.asm?.nals ?? 0} NALs${e ? ` · ffmpeg: ${e}` : ''}`;
+    }
 
     constructor(private o: KeyframeCacheOptions) {
         this.backoff = o.restartMinMs ?? 2000;
@@ -161,31 +220,30 @@ export class KeyframeCache {
             return this.scheduleRestart();
         }
         if (this.stopped) return;
-        // Copy only, no decoding: SPS/PPS repeated before every keyframe and an AUD before every access unit,
-        // so each keyframe can be cut out and decoded on its own.
+        // Copy only, no decoding; SPS/PPS repeated before every keyframe so each one decodes on its own.
         const args = [
             '-hide_banner', '-loglevel', 'error', '-nostdin',
             '-rtsp_transport', 'tcp', '-timeout', '10000000',
             '-fflags', 'nobuffer', '-flags', 'low_delay',
             '-i', this.o.url(),
             '-an', '-sn', '-dn',
-            '-c:v', 'copy', '-bsf:v', 'dump_extra=freq=keyframe,h264_metadata=aud=insert',
+            '-c:v', 'copy', '-bsf:v', 'dump_extra=freq=keyframe',
             '-flush_packets', '1',
             '-f', 'h264', 'pipe:1',
         ];
         const p = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         this.proc = p;
         live.add(p);
-        const splitter = new AccessUnitSplitter();
-        p.stdout!.on('data', (c: Buffer) => { for (const au of splitter.push(c)) this.accept(au); });
-        let err = '';
-        p.stderr!.on('data', (c: Buffer) => { err = (err + c.toString()).slice(-500); });
+        const asm = new KeyframeAssembler();
+        this.asm = asm;
+        p.stdout!.on('data', (c: Buffer) => { for (const au of asm.push(c)) this.accept(au); });
+        p.stderr!.on('data', (c: Buffer) => { this.lastError = (this.lastError + c.toString()).slice(-300); });
         p.on('exit', code => {
             live.delete(p);
             if (this.proc !== p) return;
             this.proc = undefined;
             if (this.stopped) return;
-            this.o.log(`snapshot cache: ffmpeg exited (${code})${err ? `: ${err.trim().split('\n').pop()}` : ''}`);
+            this.o.log(`snapshot cache: ffmpeg exited (${code})${this.lastError ? `: ${this.lastError.trim().split('\n').pop()}` : ''}`);
             this.scheduleRestart();
         });
     }

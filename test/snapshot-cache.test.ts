@@ -1,21 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessUnitSplitter, KeyframeCache, nalTypes } from '../src/snapshot-cache';
+import { KeyframeAssembler, KeyframeCache, nalTypes } from '../src/snapshot-cache';
 
-const nal = (type: number, n: number) => Buffer.from([0, 0, 0, 1, type, n, n]);
-const au = (...types: number[]) => Buffer.concat([Buffer.from([0, 0, 0, 1, 0x09, 0xf0]), ...types.map(t => nal(t, t))]);
+const nal = (type: number, n: number, four = true) => Buffer.from([...(four ? [0] : []), 0, 0, 1, type, n, n]);
+const au = (...types: number[]) => Buffer.concat(types.map(t => nal(t, t)));
 const key = au(0x67, 0x68, 0x65);
 const delta = au(0x41);
 
-test('splitter cuts access units at each delimiter across chunk boundaries', () => {
-    const s = new AccessUnitSplitter();
-    const all = Buffer.concat([Buffer.from([7, 7]), key, delta, delta, key]);
+test('assembler cuts whole keyframes out of a raw stream across chunk boundaries', () => {
+    const a = new KeyframeAssembler();
+    const all = Buffer.concat([Buffer.from([7, 7]), delta, key, au(0x65), delta, delta, au(0x67, 0x68), nal(0x65, 9, false), delta, delta]);
     const out: Buffer[] = [];
-    for (let i = 0; i < all.length; i += 5) out.push(...s.push(all.subarray(i, i + 5)));
-    // The last unit stays pending until the next delimiter proves it complete.
-    assert.equal(out.length, 3);
-    assert.deepEqual(nalTypes(out[0]), [9, 7, 8, 5]);
-    assert.deepEqual(nalTypes(out[1]), [9, 1]);
+    for (let i = 0; i < all.length; i += 5) out.push(...a.push(all.subarray(i, i + 5)));
+    assert.equal(out.length, 2);
+    assert.deepEqual(nalTypes(out[0]), [7, 8, 5, 5]);
+    assert.deepEqual(nalTypes(out[1]), [7, 8, 5]);
+});
+
+test('a keyframe without in-band SPS/PPS gets the latest ones', () => {
+    const a = new KeyframeAssembler();
+    const out = [...a.push(Buffer.concat([key, delta, au(0x65), delta, delta]))];
+    assert.equal(out.length, 2);
+    assert.deepEqual(nalTypes(out[1]), [7, 8, 5]);
 });
 
 const mk = (now: () => number) => new KeyframeCache({ ffmpegPath: async () => { throw new Error('none'); }, url: () => '', log: () => { }, now, restartMinMs: 1e6 });

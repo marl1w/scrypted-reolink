@@ -146,7 +146,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     private snapshotStatus(): string {
         if (!this.snapshots.running) return 'off';
         const age = this.snapshots.age();
-        return `${age === undefined ? 'no image yet' : `last keyframe ${(age / 1000).toFixed(1)} s ago`} · ${this.snapshots.keyframes} keyframes · ${this.snapshots.restarts} restarts`;
+        return `${age === undefined ? 'no image yet' : `last keyframe ${(age / 1000).toFixed(1)} s ago`} · ${this.snapshots.keyframes} keyframes · ${this.snapshots.restarts} restarts · ${this.snapshots.diag()}`;
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
