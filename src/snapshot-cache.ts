@@ -121,7 +121,11 @@ export class KeyframeCache {
         const args = [
             '-hide_banner', '-loglevel', 'error', '-nostdin',
             '-rtsp_transport', 'tcp', '-timeout', '10000000',
-            '-skip_frame', 'nokey',
+            // Low latency: frame-threaded decoding holds back one frame per thread, which with keyframes
+            // only (about 1 s apart) delays every image by seconds; demuxer buffering adds more.
+            '-fflags', 'nobuffer', '-flags', 'low_delay', '-max_delay', '0',
+            '-probesize', '32768', '-analyzeduration', '0',
+            '-threads', '1', '-skip_frame', 'nokey',
             '-i', this.o.url(),
             '-an', '-sn', '-dn',
             '-fps_mode', 'passthrough',
