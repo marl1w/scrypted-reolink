@@ -38,3 +38,9 @@ test('health line', () => {
         'Push: subscribed · 12 channels · last event 12 s ago · HTTP sessions 1 · reconnects 2');
     assert.match(formatHealth({ pushState: 'backoff', channels: 0, httpSessions: 0, reconnects: 0, lastError: 'boom' }), /never .* last error: boom$/);
 });
+
+test('camera names are prefixed with the NVR name', () => {
+    assert.equal(buildCameraDevice('nvr-1', { channel: 2, name: 'Door' }, 'Home NVR').name, 'Home NVR Door');
+    assert.equal(buildCameraDevice('nvr-1', { channel: 2 }, 'Home NVR').name, 'Home NVR Channel 3');
+    assert.equal(buildCameraDevice('nvr-1', { channel: 2, name: 'Door' }).name, 'Door');
+});

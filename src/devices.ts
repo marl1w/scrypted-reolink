@@ -49,11 +49,13 @@ export function cameraInterfaces(cache: ChannelCache): string[] {
     return ifs;
 }
 
-export function buildCameraDevice(nvrNativeId: string, cache: ChannelCache): DeviceManifest {
+/** Camera names carry the NVR name, so channels with the same name on two NVRs stay distinct. */
+export function buildCameraDevice(nvrNativeId: string, cache: ChannelCache, nvrName?: string): DeviceManifest {
+    const channelName = cache.name || `Channel ${cache.channel + 1}`;
     return {
         nativeId: cameraNativeId(nvrNativeId, cache.channel),
         providerNativeId: nvrNativeId,
-        name: cache.name || `Channel ${cache.channel + 1}`,
+        name: nvrName ? `${nvrName} ${channelName}` : channelName,
         type: 'Camera',
         interfaces: cameraInterfaces(cache),
         info: { manufacturer: 'Reolink', model: cache.model, firmware: cache.firmware },

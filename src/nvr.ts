@@ -142,7 +142,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
 
     private async syncDevices() {
         const chans: number[] = (this.storageSettings.values.channels ?? []).map((x: any) => parseInt(String(x), 10)).filter((n: number) => !isNaN(n));
-        const devices = chans.map(ch => buildCameraDevice(this.nativeId!, this.channelCache(ch) ?? { channel: ch }));
+        const devices = chans.map(ch => buildCameraDevice(this.nativeId!, this.channelCache(ch) ?? { channel: ch }, this.providedName || this.name));
         await sdk.deviceManager.onDevicesChanged({ providerNativeId: this.nativeId, devices: devices as any });
         for (const ch of chans) {
             const cache = this.channelCache(ch) ?? { channel: ch };
