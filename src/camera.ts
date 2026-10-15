@@ -3,6 +3,7 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
+import { cropNativeId, parseCrops } from './devices';
 import { addStreamCredentials, buildStreamOptions, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 
@@ -35,6 +36,14 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             type: 'boolean',
             defaultValue: false,
             onPut: (_o, v) => v ? this.snapshots.start() : this.snapshots.stop(),
+        },
+        crops: {
+            title: 'Crop Cameras',
+            description: 'Extra cameras cut from this one: Name=width:height:x:y in substream pixels. The crop itself is the Rebroadcast output prefix of the crop camera (-vf crop=...); the crop camera reads this camera through Scrypted, adding no NVR connection.',
+            multiple: true,
+            combobox: true,
+            defaultValue: [],
+            onPut: () => this.nvr.syncDevices(),
         },
         dayNight: {
             title: 'Day/Night',
@@ -75,7 +84,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     /** The lowest-resolution RTSP stream: keyframes are cheap to decode and match what HomeKit shows. */
-    private snapshotStream(): StreamOption {
+    snapshotStream(): StreamOption {
         const rtsp = this.streams().filter(s => s.container === 'rtsp' && s.url);
         rtsp.sort((a, b) => (a.video?.width ?? 1e9) - (b.video?.width ?? 1e9));
         const s = rtsp.find(x => x.id.endsWith(`_${String(this.channel + 1).padStart(2, '0')}_sub`)) ?? rtsp[0];
@@ -179,7 +188,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     async getDevice(nativeId: string): Promise<any> {
         let d = this.children.get(nativeId);
         if (!d) {
-            if (nativeId.endsWith('-siren')) d = new ReolinkSiren(nativeId, this);
+            if (nativeId.includes('-crop-')) d = new ReolinkCropCamera(nativeId, this);
+            else if (nativeId.endsWith('-siren')) d = new ReolinkSiren(nativeId, this);
             else if (nativeId.endsWith('-floodlight')) d = new ReolinkFloodlight(nativeId, this);
             if (d) this.children.set(nativeId, d);
         }
@@ -206,4 +216,41 @@ export class ReolinkFloodlight extends ScryptedDeviceBase implements OnOff {
     constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
     async turnOn() { await this.camera.nvr.api.setWhiteLed(this.camera.channel, true); this.on = true; }
     async turnOff() { await this.camera.nvr.api.setWhiteLed(this.camera.channel, false); this.on = false; }
+}
+
+/**
+ * A camera cut from its parent camera. It reads the parent through Scrypted (the parent's prebuffer, via its
+ * mixins), so it adds no NVR connection and no fixed rebroadcast URL; the crop filter is the Rebroadcast
+ * output prefix of this device. Sensorless: it has no motion of its own.
+ */
+export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera, Settings {
+    constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
+
+    private spec() {
+        return parseCrops(this.camera.storageSettings.values.crops).find(c => cropNativeId(this.camera.nativeId!, c.slug) === this.nativeId);
+    }
+
+    async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const c = this.spec();
+        return [{ id: 'crop', name: 'Crop', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height } }];
+    }
+
+    async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        const parent = sdk.systemManager.getDeviceById<VideoCamera>(this.camera.id);
+        const sub = this.camera.snapshotStream();
+        const mo = await parent.getVideoStream({ ...options, id: sub.id, destination: 'local' } as RequestMediaStreamOptions);
+        const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
+        const [opts] = await this.getVideoStreamOptions();
+        return sdk.mediaManager.createFFmpegMediaObject({ ...ff, mediaStreamOptions: { ...ff.mediaStreamOptions, ...opts } });
+    }
+
+    async getSettings(): Promise<Setting[]> {
+        const c = this.spec();
+        return [{
+            key: 'crop', title: 'Crop', readonly: true,
+            value: c ? `${this.camera.name} ${c.width}x${c.height} at ${c.x},${c.y} (Rebroadcast output prefix: -vf crop=${c.width}:${c.height}:${c.x}:${c.y} plus an H.264 encode)` : 'not configured on the parent',
+        }];
+    }
+
+    async putSetting(): Promise<void> { }
 }

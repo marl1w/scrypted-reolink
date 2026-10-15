@@ -72,6 +72,37 @@ export function buildChildDevices(cameraNativeIdValue: string, cameraName: strin
     return out;
 }
 
+export interface CropSpec { slug: string; name: string; width: number; height: number; x: number; y: number }
+
+/**
+ * Crop cameras configured on a camera, one per entry `Name=width:height:x:y` (pixels of the substream).
+ * Invalid entries are skipped.
+ */
+export function parseCrops(entries: unknown): CropSpec[] {
+    const out: CropSpec[] = [];
+    for (const e of Array.isArray(entries) ? entries : []) {
+        const m = /^\s*([^=]+?)\s*=\s*(\d+):(\d+):(\d+):(\d+)\s*$/.exec(String(e));
+        if (!m) continue;
+        const name = m[1];
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        if (!slug || out.some(c => c.slug === slug)) continue;
+        out.push({ slug, name, width: +m[2], height: +m[3], x: +m[4], y: +m[5] });
+    }
+    return out;
+}
+
+export const cropNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-crop-${slug}`;
+
+export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[]): DeviceManifest[] {
+    return crops.map(c => ({
+        nativeId: cropNativeId(cameraNativeIdValue, c.slug),
+        providerNativeId: cameraNativeIdValue,
+        name: c.name,
+        type: 'Camera',
+        interfaces: ['VideoCamera', 'Settings'],
+    }));
+}
+
 /** Channel cache from discovery results. Model follows the stock rule: the channel's typeInfo. */
 export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelStatus | undefined, details: { chnTypeInfo?: any; enc?: any }, ability: Ability | undefined, aiClasses: string[], now = Date.now()): ChannelCache {
     return {

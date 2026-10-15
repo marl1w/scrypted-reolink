@@ -3,7 +3,7 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { BaichuanClient } from './baichuan/client';
 import { formatEvent, PushEvent } from './baichuan/events';
 import { ReolinkChannelCamera } from './camera';
-import { buildCameraDevice, buildChildDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId } from './devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 
@@ -140,7 +140,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         await this.syncDevices();
     }
 
-    private async syncDevices() {
+    async syncDevices() {
         const chans: number[] = (this.storageSettings.values.channels ?? []).map((x: any) => parseInt(String(x), 10)).filter((n: number) => !isNaN(n));
         const devices = chans.map(ch => buildCameraDevice(this.nativeId!, this.channelCache(ch) ?? { channel: ch }, this.providedName || this.name));
         await sdk.deviceManager.onDevicesChanged({ providerNativeId: this.nativeId, devices: devices as any });
@@ -148,7 +148,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             const cache = this.channelCache(ch) ?? { channel: ch };
             const camId = cameraNativeId(this.nativeId!, ch);
             const name = devices.find(d => d.nativeId === camId)!.name;
-            const children = buildChildDevices(camId, name, cache);
+            const crops = parseCrops(JSON.parse(sdk.deviceManager.getDeviceStorage(camId)?.getItem('crops') || '[]'));
+            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops)];
             if (children.length)
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
         }

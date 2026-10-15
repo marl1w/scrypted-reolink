@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCameraDevice, buildChildDevices, cameraNativeId, channelCacheFrom, formatHealth, parseCameraNativeId } from '../src/devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, parseCrops, cameraNativeId, channelCacheFrom, formatHealth, parseCameraNativeId } from '../src/devices';
 
 const ability = { abilityChn: [{ supportAudioAlarm: { ver: 1 } }, {}, { floodLight: { ver: 1 } }] };
 
@@ -43,4 +43,12 @@ test('camera names are prefixed with the NVR name', () => {
     assert.equal(buildCameraDevice('nvr-1', { channel: 2, name: 'Door' }, 'Home NVR').name, 'Home NVR Door');
     assert.equal(buildCameraDevice('nvr-1', { channel: 2 }, 'Home NVR').name, 'Home NVR Channel 3');
     assert.equal(buildCameraDevice('nvr-1', { channel: 2, name: 'Door' }).name, 'Door');
+});
+
+test('crop entries parse to unique slugs and skip invalid ones', () => {
+    const c = parseCrops(['Parking Spot=768:576:0:0', 'bad', 'Parking spot=1:1:1:1', 'Gate = 320:240:10:20']);
+    assert.deepEqual(c.map(x => [x.slug, x.width, x.height, x.x, x.y]), [['parking-spot', 768, 576, 0, 0], ['gate', 320, 240, 10, 20]]);
+    assert.deepEqual(buildCropDevices('nvr-1-ch8', c).map(d => [d.nativeId, d.providerNativeId, d.type]),
+        [['nvr-1-ch8-crop-parking-spot', 'nvr-1-ch8', 'Camera'], ['nvr-1-ch8-crop-gate', 'nvr-1-ch8', 'Camera']]);
+    assert.deepEqual(parseCrops(undefined), []);
 });
