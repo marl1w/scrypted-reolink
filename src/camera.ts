@@ -1,9 +1,9 @@
-import sdk, { Camera, DeviceProvider, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, Online, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import sdk, { Camera, DeviceProvider, EventListenerRegister, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
-import { cropNativeId, parseCrops } from './devices';
+import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, parseCrops, parseMirrors, parseViewCrop } from './devices';
 import { addStreamCredentials, buildStreamOptions, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 
@@ -45,6 +45,19 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             defaultValue: [],
             onPut: () => this.nvr.syncDevices(),
         },
+        viewCrop: {
+            title: 'View Crop',
+            description: 'Show only part of the frame as this camera: width:height:x:y in substream pixels, empty for the whole frame. Adds a "View" stream, the substream cropped by the Rebroadcast output prefix of that stream (-vf crop=... plus an H.264 encode); snapshots are cropped the same way. Crop cameras still read the whole substream.',
+            defaultValue: '',
+        },
+        mirrors: {
+            title: 'Mirror Cameras',
+            description: 'Name=<crop camera name>: the same stream, motion and presence as that crop camera, as another accessory (a HomeKit accessory pairs into one Home only). Nothing is encoded or analysed twice.',
+            multiple: true,
+            combobox: true,
+            defaultValue: [],
+            onPut: () => this.nvr.syncDevices(),
+        },
         dayNight: {
             title: 'Day/Night',
             readonly: true,
@@ -79,8 +92,32 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
             source: () => this.snapshotSource(),
             log: m => this.console.warn(m),
+            videoFilter: () => {
+                const v = this.viewCrop();
+                return v && `crop=${v.width}:${v.height}:${v.x}:${v.y}`;
+            },
         });
         if (this.storageSettings.values.snapshotCache) this.snapshots.start();
+    }
+
+    viewCrop() {
+        return parseViewCrop(this.storageSettings.values.viewCrop);
+    }
+
+    private viewOption(): ResponseMediaStreamOptions | undefined {
+        const v = this.viewCrop();
+        return v && { id: 'view', name: 'View', container: 'rtsp', video: { codec: 'h264', width: v.width, height: v.height } };
+    }
+
+    /**
+     * The substream as this device's mixins serve it (the Rebroadcast prebuffer, so no new NVR connection),
+     * labelled as another stream: the View stream and the crop cameras are built on it.
+     */
+    async readSubstream(options: RequestMediaStreamOptions | undefined, opts: ResponseMediaStreamOptions): Promise<MediaObject> {
+        const self = sdk.systemManager.getDeviceById<VideoCamera>(this.id);
+        const mo = await self.getVideoStream({ ...options, id: this.snapshotStream().id, destination: 'local' } as RequestMediaStreamOptions);
+        const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
+        return sdk.mediaManager.createFFmpegMediaObject({ ...ff, mediaStreamOptions: { ...ff.mediaStreamOptions, ...opts } });
     }
 
     /** The lowest-resolution RTSP stream: keyframes are cheap to decode and match what HomeKit shows. */
@@ -133,10 +170,13 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        return this.streams();
+        const view = this.viewOption();
+        return view ? [...this.streams(), view] : this.streams();
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        const view = this.viewOption();
+        if (view && options?.id === view.id) return this.readSubstream(options, view);
         const vsos = this.streams();
         const vso = vsos.find(s => s.id === options?.id) || vsos[0];
         const ret: MediaStreamUrl = {
@@ -188,7 +228,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     async getDevice(nativeId: string): Promise<any> {
         let d = this.children.get(nativeId);
         if (!d) {
-            if (nativeId.includes('-crop-')) d = new ReolinkCropCamera(nativeId, this);
+            if (nativeId.includes('-mirror-')) d = new ReolinkMirrorCamera(nativeId, this);
+            else if (nativeId.includes('-crop-')) d = new ReolinkCropCamera(nativeId, this);
             else if (nativeId.endsWith('-siren')) d = new ReolinkSiren(nativeId, this);
             else if (nativeId.endsWith('-floodlight')) d = new ReolinkFloodlight(nativeId, this);
             if (d) this.children.set(nativeId, d);
@@ -197,10 +238,12 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     async releaseDevice(_id: string, nativeId: string): Promise<void> {
+        (this.children.get(nativeId) as ReolinkMirrorCamera | undefined)?.dispose?.();
         this.children.delete(nativeId);
     }
 
     dispose() {
+        for (const d of this.children.values()) (d as ReolinkMirrorCamera).dispose?.();
         this.motion.dispose();
         this.snapshots.stop();
     }
@@ -236,12 +279,8 @@ export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
-        const parent = sdk.systemManager.getDeviceById<VideoCamera>(this.camera.id);
-        const sub = this.camera.snapshotStream();
-        const mo = await parent.getVideoStream({ ...options, id: sub.id, destination: 'local' } as RequestMediaStreamOptions);
-        const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
         const [opts] = await this.getVideoStreamOptions();
-        return sdk.mediaManager.createFFmpegMediaObject({ ...ff, mediaStreamOptions: { ...ff.mediaStreamOptions, ...opts } });
+        return this.camera.readSubstream(options, opts);
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -253,4 +292,151 @@ export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera
     }
 
     async putSetting(): Promise<void> { }
+}
+
+const MIRROR_RETRY_MS = 30000;
+
+/**
+ * Another accessory for one of the parent's crop cameras: it serves the crop camera's stream as that camera's
+ * mixins serve it (already cropped and encoded, so this device's Rebroadcast only copies it), and repeats its
+ * motion, occupancy, detections and Coral Guard presence. Nothing is encoded or analysed a second time.
+ */
+export class ReolinkMirrorCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, OccupancySensor, ObjectDetector, Settings, DeviceProvider {
+    private listeners: EventListenerRegister[] = [];
+    private boundTo?: string;
+    private missing: string[] = [];
+    private timer?: NodeJS.Timeout;
+    private presence = new Map<string, MirrorPresence>();
+    private disposed = false;
+
+    constructor(nativeId: string, readonly camera: ReolinkChannelCamera) {
+        super(nativeId);
+        this.bindSoon(0);
+    }
+
+    private spec() {
+        const crops = parseCrops(this.camera.storageSettings.values.crops);
+        return parseMirrors(this.camera.storageSettings.values.mirrors, crops).find(m => mirrorNativeId(this.camera.nativeId!, m.slug) === this.nativeId);
+    }
+
+    private async source() {
+        const s = this.spec();
+        if (!s) throw new Error('not configured on the parent');
+        const crop = await this.camera.getDevice(cropNativeId(this.camera.nativeId!, s.source)) as ScryptedDeviceBase | undefined;
+        const dev = crop?.id && sdk.systemManager.getDeviceById<ScryptedDevice & VideoCamera & Camera & MotionSensor & OccupancySensor & ObjectDetector>(crop.id);
+        if (!dev) throw new Error(`crop camera ${s.source} not found`);
+        return dev;
+    }
+
+    private bindSoon(ms: number) {
+        clearTimeout(this.timer);
+        if (this.disposed) return;
+        this.timer = setTimeout(() => this.bind().catch(e => {
+            this.console.warn(`mirror: ${(e as Error).message}, retrying`);
+            this.bindSoon(MIRROR_RETRY_MS);
+        }), ms);
+    }
+
+    private unbind() {
+        for (const l of this.listeners) l.removeListener();
+        this.listeners = [];
+        this.boundTo = undefined;
+    }
+
+    /** Follows the source's state; Coral Guard's presence sensors may appear later, so missing ones are retried. */
+    private async bind() {
+        const src = await this.source();
+        if (this.boundTo === src.id && !this.missing.length) return;
+        this.unbind();
+        const sm = sdk.systemManager;
+        this.motionDetected = !!src.motionDetected;
+        this.occupied = !!src.occupied;
+        this.listeners.push(
+            sm.listenDevice(src.id, ScryptedInterface.MotionSensor, (_s, _d, data) => { this.motionDetected = !!data; }),
+            sm.listenDevice(src.id, ScryptedInterface.OccupancySensor, (_s, _d, data) => { this.occupied = !!data; }),
+            sm.listenDevice(src.id, ScryptedInterface.ObjectDetector, (_s, _d, data) => { sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, data); }),
+        );
+        const state = sm.getSystemState();
+        this.missing = [];
+        for (const g of MIRROR_PRESENCE) {
+            const name = `${src.name} ${g} Presence`;
+            const id = Object.keys(state).find(i => state[i]?.name?.value === name && (state[i]?.interfaces?.value || []).includes(ScryptedInterface.OccupancySensor));
+            const child = this.presenceChild(`${this.nativeId}-${g.toLowerCase()}`);
+            if (!id) {
+                this.missing.push(name);
+                continue;
+            }
+            child.occupied = !!sm.getDeviceById<OccupancySensor>(id).occupied;
+            this.listeners.push(sm.listenDevice(id, ScryptedInterface.OccupancySensor, (_s, _d, data) => { child.occupied = !!data; }));
+        }
+        this.boundTo = src.id;
+        this.console.log(`mirror: following ${src.name}${this.missing.length ? ` (not found yet: ${this.missing.join(', ')})` : ''}`);
+        if (this.missing.length) this.bindSoon(MIRROR_RETRY_MS);
+    }
+
+    private presenceChild(nativeId: string) {
+        let c = this.presence.get(nativeId);
+        if (!c) this.presence.set(nativeId, c = new MirrorPresence(nativeId));
+        return c;
+    }
+
+    async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const s = this.spec();
+        const c = s && parseCrops(this.camera.storageSettings.values.crops).find(x => x.slug === s.source);
+        return [{ id: 'mirror', name: 'Mirror', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height } }];
+    }
+
+    async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        const src = await this.source();
+        const mo = await src.getVideoStream({ ...options, id: 'crop', destination: 'local' } as RequestMediaStreamOptions);
+        const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
+        const [opts] = await this.getVideoStreamOptions();
+        return sdk.mediaManager.createFFmpegMediaObject({ ...ff, mediaStreamOptions: { ...ff.mediaStreamOptions, ...opts } });
+    }
+
+    async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        return (await this.source()).takePicture(options);
+    }
+
+    async getPictureOptions(): Promise<PictureOptions[]> {
+        return [];
+    }
+
+    async getObjectTypes(): Promise<ObjectDetectionTypes> {
+        const src = await this.source().catch(() => undefined);
+        return (await src?.getObjectTypes?.().catch(() => undefined)) ?? { classes: [] };
+    }
+
+    async getDetectionInput(): Promise<MediaObject> {
+        throw new Error('detection input not available');
+    }
+
+    async getSettings(): Promise<Setting[]> {
+        const s = this.spec();
+        const src = await this.source().catch(() => undefined);
+        return [{
+            key: 'mirror', title: 'Mirror', readonly: true,
+            value: s ? `${src?.name ?? s.source}: same stream, motion, detections and presence${this.missing.length ? ` · not found yet: ${this.missing.join(', ')}` : ''}` : 'not configured on the parent',
+        }];
+    }
+
+    async putSetting(): Promise<void> { }
+
+    async getDevice(nativeId: string): Promise<any> {
+        return this.presenceChild(nativeId);
+    }
+
+    async releaseDevice(_id: string, nativeId: string): Promise<void> {
+        this.presence.delete(nativeId);
+    }
+
+    dispose() {
+        this.disposed = true;
+        clearTimeout(this.timer);
+        this.unbind();
+    }
+}
+
+export class MirrorPresence extends ScryptedDeviceBase implements OccupancySensor {
+    constructor(nativeId: string) { super(nativeId); }
 }

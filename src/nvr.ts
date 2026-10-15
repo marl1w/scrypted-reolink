@@ -3,7 +3,7 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { BaichuanClient } from './baichuan/client';
 import { formatEvent, PushEvent } from './baichuan/events';
 import { ReolinkChannelCamera } from './camera';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops } from './devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops, parseMirrors } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 
@@ -148,10 +148,14 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             const cache = this.channelCache(ch) ?? { channel: ch };
             const camId = cameraNativeId(this.nativeId!, ch);
             const name = devices.find(d => d.nativeId === camId)!.name;
-            const crops = parseCrops(JSON.parse(sdk.deviceManager.getDeviceStorage(camId)?.getItem('crops') || '[]'));
-            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops)];
+            const storage = sdk.deviceManager.getDeviceStorage(camId);
+            const crops = parseCrops(JSON.parse(storage?.getItem('crops') || '[]'));
+            const mirrors = buildMirrorDevices(camId, parseMirrors(JSON.parse(storage?.getItem('mirrors') || '[]'), crops));
+            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops), ...mirrors.mirrors];
             if (children.length)
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
+            for (const m of mirrors.mirrors)
+                await sdk.deviceManager.onDevicesChanged({ providerNativeId: m.nativeId, devices: mirrors.children.filter(c => c.providerNativeId === m.nativeId) as any });
         }
         this.updateCameraOnline();
     }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, parseCrops, cameraNativeId, channelCacheFrom, formatHealth, parseCameraNativeId } from '../src/devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, parseCrops, parseMirrors, parseViewCrop, cameraNativeId, channelCacheFrom, formatHealth, parseCameraNativeId } from '../src/devices';
 
 const ability = { abilityChn: [{ supportAudioAlarm: { ver: 1 } }, {}, { floodLight: { ver: 1 } }] };
 
@@ -51,4 +51,24 @@ test('crop entries parse to unique slugs and skip invalid ones', () => {
     assert.deepEqual(buildCropDevices('nvr-1-ch8', c).map(d => [d.nativeId, d.providerNativeId, d.type]),
         [['nvr-1-ch8-crop-parking-spot', 'nvr-1-ch8', 'Camera'], ['nvr-1-ch8-crop-gate', 'nvr-1-ch8', 'Camera']]);
     assert.deepEqual(parseCrops(undefined), []);
+});
+
+test('view crop: width:height:x:y or the whole frame', () => {
+    assert.deepEqual(parseViewCrop('928:576:608:0'), { width: 928, height: 576, x: 608, y: 0 });
+    assert.equal(parseViewCrop(''), undefined);
+    assert.equal(parseViewCrop(undefined), undefined);
+    assert.equal(parseViewCrop('928:576'), undefined);
+});
+
+test('mirror cameras follow a configured crop and get presence children', () => {
+    const crops = parseCrops(['home_b_drive (Baichuan)=928:576:0:0']);
+    const m = parseMirrors(['home_a_drive=home_b_drive (Baichuan)', 'Other=missing', 'bad', 'home_b_drive (Baichuan)=home_b_drive (Baichuan)'], crops);
+    assert.deepEqual(m, [{ slug: 'home-a-drive', name: 'home_a_drive', source: 'home-b-drive-baichuan' }]);
+    const d = buildMirrorDevices('nvr-1-ch8', m);
+    assert.deepEqual(d.mirrors.map(x => [x.nativeId, x.providerNativeId, x.type]), [['nvr-1-ch8-mirror-home-a-drive', 'nvr-1-ch8', 'Camera']]);
+    assert.deepEqual(d.children.map(x => [x.nativeId, x.providerNativeId, x.name]), [
+        ['nvr-1-ch8-mirror-home-a-drive-vehicle', 'nvr-1-ch8-mirror-home-a-drive', 'home_a_drive Vehicle Presence'],
+        ['nvr-1-ch8-mirror-home-a-drive-animal', 'nvr-1-ch8-mirror-home-a-drive', 'home_a_drive Animal Presence'],
+    ]);
+    assert.deepEqual(parseMirrors(undefined, crops), []);
 });

@@ -103,6 +103,55 @@ export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[])
     }));
 }
 
+/** The camera's own view: `width:height:x:y` in substream pixels, or undefined for the whole frame. */
+export function parseViewCrop(value: unknown): Omit<CropSpec, 'slug' | 'name'> | undefined {
+    const m = /^\s*(\d+):(\d+):(\d+):(\d+)\s*$/.exec(String(value ?? ''));
+    return m ? { width: +m[1], height: +m[2], x: +m[3], y: +m[4] } : undefined;
+}
+
+export interface MirrorSpec { slug: string; name: string; source: string }
+
+/**
+ * Mirror cameras, one per entry `Name=<crop name>`: the same stream, motion and presence as one of this
+ * camera's crops, as a second accessory (a HomeKit accessory pairs into one Home only). Entries naming no
+ * configured crop are skipped.
+ */
+export function parseMirrors(entries: unknown, crops: CropSpec[]): MirrorSpec[] {
+    const slugOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const out: MirrorSpec[] = [];
+    for (const e of Array.isArray(entries) ? entries : []) {
+        const m = /^\s*([^=]+?)\s*=\s*(.+?)\s*$/.exec(String(e));
+        if (!m) continue;
+        const slug = slugOf(m[1]);
+        const source = crops.find(c => c.slug === slugOf(m[2]));
+        if (!slug || !source || out.some(x => x.slug === slug) || crops.some(c => c.slug === slug)) continue;
+        out.push({ slug, name: m[1], source: source.slug });
+    }
+    return out;
+}
+
+export const mirrorNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-mirror-${slug}`;
+
+export const MIRROR_PRESENCE = ['Vehicle', 'Animal'] as const;
+
+export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorSpec[]): { mirrors: DeviceManifest[]; children: DeviceManifest[] } {
+    const out = { mirrors: [] as DeviceManifest[], children: [] as DeviceManifest[] };
+    for (const m of mirrors) {
+        const nativeId = mirrorNativeId(cameraNativeIdValue, m.slug);
+        out.mirrors.push({
+            nativeId,
+            providerNativeId: cameraNativeIdValue,
+            name: m.name,
+            type: 'Camera',
+            interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector', 'Settings', 'DeviceProvider'],
+        });
+        // Named "<camera> Vehicle Presence" so the patched HomeKit plugin puts them inside the camera tile.
+        for (const g of MIRROR_PRESENCE)
+            out.children.push({ nativeId: `${nativeId}-${g.toLowerCase()}`, providerNativeId: nativeId, name: `${m.name} ${g} Presence`, type: 'Sensor', interfaces: ['OccupancySensor'] });
+    }
+    return out;
+}
+
 /** Channel cache from discovery results. Model follows the stock rule: the channel's typeInfo. */
 export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelStatus | undefined, details: { chnTypeInfo?: any; enc?: any }, ability: Ability | undefined, aiClasses: string[], now = Date.now()): ChannelCache {
     return {

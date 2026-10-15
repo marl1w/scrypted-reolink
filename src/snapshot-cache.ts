@@ -102,6 +102,8 @@ export interface KeyframeCacheOptions {
     /** Where to read the stream; retryMs asks for another try later (e.g. a fallback source). */
     source: () => Promise<{ url: string; label: string; retryMs?: number }>;
     log: (msg: string) => void;
+    /** ffmpeg -vf applied when a keyframe is decoded (e.g. the camera's view crop); undefined = whole frame. */
+    videoFilter?: () => string | undefined;
     now?: () => number;
     restartMinMs?: number;
     restartMaxMs?: number;
@@ -196,7 +198,9 @@ export class KeyframeCache {
     private async decode(au: Buffer): Promise<Buffer | undefined> {
         const ffmpeg = await this.o.ffmpegPath();
         return new Promise(resolve => {
+            const vf = this.o.videoFilter?.();
             const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'h264', '-i', 'pipe:0',
+                ...(vf ? ['-vf', vf] : []),
                 '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2pipe', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
             live.add(p);
             const chunks: Buffer[] = [];
