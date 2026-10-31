@@ -10,6 +10,18 @@ export interface ReolinkTime { year: number; mon: number; day: number; hour: num
 
 export type RecordingStreamType = 'main' | 'sub';
 
+/**
+ * The recording a request plays: the asked stream id, else the destination (low resolution and remote ask for the
+ * substream), else the main stream, unless the main stream is H.265: the NVR serves it as an FLV ffmpeg cannot read
+ * (a browser could not play H.265 either), so the substream is the default then.
+ */
+export function recordingStreamFor(options: { id?: string; destination?: string } | undefined, mainH265: boolean): RecordingStreamType {
+    if (options?.id === 'main' || options?.id === 'sub') return options.id;
+    const d = options?.destination;
+    if (d === 'low-resolution' || d === 'medium-resolution' || d === 'remote' || d === 'remote-recorder') return 'sub';
+    return mainH265 ? 'sub' : 'main';
+}
+
 const MINUTE = 60_000;
 const DAY = 86_400_000;
 

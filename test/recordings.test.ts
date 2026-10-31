@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
     alarmVideoOpenXml, buildClips, decodeClipId, downloadUrl, dstTransition, encodeClipId, flvUrl, isContinuousDay, isNight,
     parseAlarmVideos, parseFileHandle, parseSearchFiles, parseTimeId, playbackIsUtc, playbackUrl, RawFile, RecorderZone,
-    recorderDays, recordingInputArgs, scrubUrls, splitRecordings, thumbnailArgs, timeId, wallMs,
+    recorderDays, recordingInputArgs, recordingStreamFor, scrubUrls, splitRecordings, thumbnailArgs, timeId, wallMs,
 } from '../src/recordings';
 
 const KEY = Buffer.alloc(32, 7);
@@ -226,4 +226,11 @@ test('the hour repeated in autumn is decided by row order, whatever PlaybackTime
         assert.ok(out.every(r => r.end >= r.start && r.start >= r.fileStart), label);
         assert.ok(out.every(r => r.offset === 0), label);
     }
+});
+
+test('recording stream: asked id, then destination, then main unless main is H.265', () => {
+    assert.equal(recordingStreamFor({ id: 'main' }, true), 'main');
+    assert.equal(recordingStreamFor({ destination: 'remote' }, false), 'sub');
+    assert.equal(recordingStreamFor(undefined, false), 'main');
+    assert.equal(recordingStreamFor({ destination: 'local' }, true), 'sub');
 });

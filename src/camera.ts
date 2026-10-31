@@ -7,7 +7,7 @@ import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
 import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, nightModeNativeId, parseCrops, parseMirrors, parseViewCrop, rawClasses, rawClassNativeId, rawMotionNativeId } from './devices';
-import { isNight, MediaLinkKind, RecordingStreamType } from './recordings';
+import { isNight, MediaLinkKind, recordingStreamFor, RecordingStreamType } from './recordings';
 import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
 import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
@@ -473,14 +473,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         throw new Error('not supported: NVR recordings are never deleted from here');
     }
 
-    /**
-     * main or sub: the asked stream id, else the destination (low resolution and remote ask for the substream),
-     * else the main stream.
-     */
     private recordingStream(options?: RequestMediaStreamOptions): RecordingStreamType {
-        if (options?.id === 'main' || options?.id === 'sub') return options.id;
-        const d = options?.destination;
-        return d === 'low-resolution' || d === 'medium-resolution' || d === 'remote' || d === 'remote-recorder' ? 'sub' : 'main';
+        const v = this.nvr.channelCache(this.channel)?.enc?.mainStream?.vType;
+        return recordingStreamFor(options, v === 'h265' || v === 'hevc');
     }
 
     async getRecordingStream(options: RequestRecordingStreamOptions, _recordingStream?: MediaObject): Promise<MediaObject> {

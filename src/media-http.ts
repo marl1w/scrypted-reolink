@@ -35,8 +35,6 @@ function sendError(res: HttpResponse, code: number, msg: string) {
 const CLIP_KEEP_MS = 60_000;
 /** A clip stops being remuxed past this many bytes (hours of substream). */
 const CLIP_MAX_BYTES = 256 * 1024 * 1024;
-/** Clips kept at once; past that, the least recently read idle one goes. */
-const CLIPS_KEPT = 4;
 
 /**
  * A clip being remuxed, with every byte so far. A browser's <video> drops its connection when paused or off screen and
@@ -47,12 +45,10 @@ export class ClipBuffer {
     size = 0;
     done = false;
     private readers = 0;
-    lastRead: number;
     private waiters: (() => void)[] = [];
     private idle?: ReturnType<typeof setTimeout>;
 
-    constructor(private clip: { stream: AsyncGenerator<Buffer, void>; stop: () => void }, private now: () => number, private onIdle: () => void) {
-        this.lastRead = now();
+    constructor(private clip: { stream: AsyncGenerator<Buffer, void>; stop: () => void }, private onIdle: () => void) {
         this.armIdle();
         void this.pump();
     }
@@ -109,7 +105,6 @@ export class ClipBuffer {
         }
         finally {
             this.readers--;
-            this.lastRead = this.now();
             this.armIdle();
         }
     }
@@ -118,13 +113,15 @@ export class ClipBuffer {
 /** Clips being served, by link (NVR, channel, clip). */
 export const clipBuffers = new Map<string, ClipBuffer>();
 
-/** The clip's buffer, starting its remux when there is none; a fresh one makes room by dropping idle ones. */
-async function clipBuffer(key: string, r: NvrRecordings, channel: number, clipId: string, now: () => number): Promise<ClipBuffer> {
+/**
+ * The clip's buffer, starting its remux when there is none. A fresh one drops the clips nobody is reading, so their
+ * ffmpeg gives its NVR playback slot back at once (one viewer moves from clip to clip).
+ */
+async function clipBuffer(key: string, r: NvrRecordings, channel: number, clipId: string): Promise<ClipBuffer> {
     const had = clipBuffers.get(key);
     if (had) return had;
-    const idle = [...clipBuffers].filter(([, b]) => b.idleNow).sort((x, y) => x[1].lastRead - y[1].lastRead);
-    while (clipBuffers.size >= CLIPS_KEPT && idle.length) {
-        const [k, b] = idle.shift()!;
+    for (const [k, b] of clipBuffers) {
+        if (!b.idleNow) continue;
         b.stop();
         clipBuffers.delete(k);
     }
@@ -135,7 +132,7 @@ async function clipBuffer(key: string, r: NvrRecordings, channel: number, clipId
         clip.stop();
         return raced;
     }
-    const b: ClipBuffer = new ClipBuffer(clip, now, () => {
+    const b: ClipBuffer = new ClipBuffer(clip, () => {
         b.stop();
         if (clipBuffers.get(key) === b) clipBuffers.delete(key);
     });
@@ -199,7 +196,7 @@ export async function handleMediaRequest(req: HttpRequest, res: HttpResponse, nv
             res.send('', { code: 416, headers: { ...headers, 'Content-Range': 'bytes */*' } });
             return true;
         }
-        b ??= await clipBuffer(key, r, link.channel, link.clipId, now);
+        b ??= await clipBuffer(key, r, link.channel, link.clipId);
         if (b.done) {
             const last = Math.min(to ?? Infinity, b.size - 1);
             if (from > last) {
