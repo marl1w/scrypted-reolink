@@ -311,14 +311,25 @@ export class ReolinkSiren extends ScryptedDeviceBase implements OnOff {
 
 export class ReolinkFloodlight extends ScryptedDeviceBase implements OnOff {
     constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
-    async turnOn() {
+    /** A manual switch lights for at most FLOODLIGHT_ON_S: while it should stay on, it is switched on again before that. */
+    private keepOn?: NodeJS.Timeout;
+
+    private send(on: boolean) {
         const ch = this.camera.channel;
-        await this.camera.nvr.pushClient().channelCommand(Cmd.FloodlightManual, ch, floodlightXml(ch, true));
-        this.on = true;
+        return this.camera.nvr.pushClient().channelCommand(Cmd.FloodlightManual, ch, floodlightXml(ch, on, FLOODLIGHT_ON_S));
     }
+
+    async turnOn() {
+        await this.send(true);
+        this.on = true;
+        clearInterval(this.keepOn);
+        this.keepOn = setInterval(() => this.send(true).catch(e => this.console.warn(`floodlight keep-on: ${(e as Error).message}`)), FLOODLIGHT_REFRESH_MS);
+    }
+
     async turnOff() {
-        const ch = this.camera.channel;
-        await this.camera.nvr.pushClient().channelCommand(Cmd.FloodlightManual, ch, floodlightXml(ch, false));
+        clearInterval(this.keepOn);
+        this.keepOn = undefined;
+        await this.send(false);
         this.on = false;
     }
 }
@@ -357,6 +368,9 @@ export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera
 }
 
 const MIRROR_RETRY_MS = 30000;
+/** Duration of a manual floodlight switch, and how often a light that should stay on is switched on again. */
+const FLOODLIGHT_ON_S = 180;
+const FLOODLIGHT_REFRESH_MS = 150_000;
 
 /**
  * Another accessory for one of the parent's crop cameras: it serves the crop camera's stream as that camera's
