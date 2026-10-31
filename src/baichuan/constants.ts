@@ -17,6 +17,7 @@ export const Cmd = {
     AudioAlarmPlay: 263, // siren, as reolink_aio's AudioAlarmPlay
     FloodlightManual: 288, // floodlight on/off, as reolink_aio's set_floodlight
     FloodlightStatus: 291, // push: floodlight state per channel
+    SirenStatus: 547, // push: siren state per channel, also when the camera sounds it itself (reolink_aio, HA's siren entity)
     VersionInfo: 318, // VersionInfo of one channel's camera, with its serial number (verified)
     UdpHeartbeat: 234,
 } as const;

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { formatEvent, parseAlarmEvents, parseFloodlightStatus } from '../src/baichuan/events';
+import { formatEvent, parseAlarmEvents, parseFloodlightStatus, parseSirenStatus } from '../src/baichuan/events';
 import { parseDeviceInfo } from '../src/baichuan/connection';
 
 // Tests run from out-test/test; fixtures stay in the source tree.
@@ -58,4 +58,13 @@ test('login reply DeviceInfo', () => {
 test('floodlight status pushes: channel and state of each entry', () => {
     const xml = '<?xml version="1.0" encoding="UTF-8" ?><body><FloodlightStatusList version="1.1"><FloodlightStatus><channel>2</channel><status>1</status></FloodlightStatus><FloodlightStatus><channel>5</channel><status>0</status></FloodlightStatus></FloodlightStatusList></body>';
     assert.deepEqual(parseFloodlightStatus(xml), [{ channel: 2, on: true }, { channel: 5, on: false }]);
+});
+
+test('siren status pushes: channel and state of each SirenStatus', () => {
+    assert.deepEqual(parseSirenStatus(fx('siren-status.xml')), [{ channel: 1, on: true }, { channel: 4, on: false }]);
+});
+
+test('siren status pushes: entries without a numeric channel or status are skipped', () => {
+    const xml = '<?xml version="1.0" encoding="UTF-8" ?><body><SirenStatus><channel>2</channel></SirenStatus><SirenStatus><channel>x</channel><status>1</status></SirenStatus><Other><channel>3</channel><status>1</status></Other></body>';
+    assert.deepEqual(parseSirenStatus(xml), []);
 });

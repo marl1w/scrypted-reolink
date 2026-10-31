@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<SirenStatusList version="1.1">
+<SirenStatus>
+<channel>1</channel>
+<status>1</status>
+</SirenStatus>
+<SirenStatus>
+<channel>4</channel>
+<status>0</status>
+</SirenStatus>
+</SirenStatusList>
+</body>

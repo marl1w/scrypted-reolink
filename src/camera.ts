@@ -137,6 +137,13 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         }).catch(() => { /* no floodlight on this channel */ });
     }
 
+    /** The siren's state as the NVR pushes it (cmd 547), also when the camera sounds it by itself. */
+    sirenState(on: boolean) {
+        this.getDevice(`${this.nativeId}-siren`).then((s?: ReolinkSiren) => {
+            if (s && s.on !== on) s.on = on;
+        }).catch(() => { /* no siren on this channel */ });
+    }
+
     /** Subscribed again: until the next push says otherwise, nothing is active. */
     rawSubscribed() {
         if (!this.rawKnown) this.publishRaw(false, []);

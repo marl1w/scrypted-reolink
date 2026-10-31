@@ -2,7 +2,7 @@ import sdk, { DeviceProvider, Online, ScryptedDeviceBase, Setting, Settings, Set
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { BaichuanClient } from './baichuan/client';
 import { Cmd } from './baichuan/constants';
-import { formatEvent, parseFloodlightStatus, PushEvent } from './baichuan/events';
+import { formatEvent, parseFloodlightStatus, parseSirenStatus, PushEvent } from './baichuan/events';
 import { parseMac, parseUid, parseVersionInfo } from './baichuan/info';
 import { Frame } from './baichuan/frame';
 import { ReolinkChannelCamera } from './camera';
@@ -102,12 +102,22 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         push.on('login', d => this.console.log(`push login ok, ${d.channelNum ?? '?'} channels`));
         push.on('event', ev => this.onPush(ev));
         push.on('push', (f: Frame, xml: string) => {
-            if (f.cmd !== Cmd.FloodlightStatus) return;
-            try {
-                for (const s of parseFloodlightStatus(xml)) this.cameras.get(cameraNativeId(this.nativeId!, s.channel))?.floodlightState(s.on);
+            const camera = (ch: number) => this.cameras.get(cameraNativeId(this.nativeId!, ch));
+            if (f.cmd === Cmd.FloodlightStatus) {
+                try {
+                    for (const s of parseFloodlightStatus(xml)) camera(s.channel)?.floodlightState(s.on);
+                }
+                catch (e) {
+                    this.console.warn(`floodlight status: ${(e as Error).message}`);
+                }
             }
-            catch (e) {
-                this.console.warn(`floodlight status: ${(e as Error).message}`);
+            else if (f.cmd === Cmd.SirenStatus) {
+                try {
+                    for (const s of parseSirenStatus(xml)) camera(s.channel)?.sirenState(s.on);
+                }
+                catch (e) {
+                    this.console.warn(`siren status: ${(e as Error).message}`);
+                }
             }
         });
         push.start();

@@ -1,5 +1,5 @@
 import { XML_DECL } from './constants';
-import { childText, findFirst, parseXml, XmlNode } from './xml';
+import { childText, findAll, findFirst, parseXml, XmlNode } from './xml';
 
 /** AI classes reported in AItype. Unknown classes are passed through as strings. */
 export type AiType = 'people' | 'vehicle' | 'dog_cat' | 'face' | 'package' | 'other' | (string & {});
@@ -94,6 +94,20 @@ export function parseFloodlightStatus(xml: string | XmlNode): { channel: number;
         else n.children.forEach(visit);
     };
     visit(root);
+    return out;
+}
+
+/**
+ * Siren state pushes (cmd 547): one entry per SirenStatus element, as reolink_aio reads them. Sent on every change,
+ * including a siren the camera sounds by itself (an alarm rule, the Reolink app).
+ */
+export function parseSirenStatus(xml: string | XmlNode): { channel: number; on: boolean }[] {
+    const root = typeof xml === 'string' ? parseXml(xml) : xml;
+    const out: { channel: number; on: boolean }[] = [];
+    for (const n of findAll(root, 'SirenStatus')) {
+        const ch = childText(n, 'channel'), st = childText(n, 'status');
+        if (ch !== undefined && st !== undefined && /^\d+$/.test(ch) && /^\d+$/.test(st)) out.push({ channel: parseInt(ch, 10), on: st === '1' });
+    }
     return out;
 }
 
