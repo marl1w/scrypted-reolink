@@ -108,15 +108,22 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     private rawKnown = false;
     private rawConfigKey = '';
+    private rawLast: { motion: boolean | undefined; classes: string[] } = { motion: undefined, classes: [] };
 
     /** Subscribed again: until the next push says otherwise, nothing is active. */
     rawSubscribed() {
         if (!this.rawKnown) this.publishRaw(false, []);
     }
 
+    /** The channel's AI classes may have changed (discovery): republish the entities with the last known state. */
+    rawRediscovered() {
+        if (this.rawKnown) this.publishRaw(this.rawLast.motion, this.rawLast.classes);
+    }
+
     /** The camera's own motion and AI classes, exact, as entities of this camera in the Scrypted MQTT bridge. */
     private publishRaw(motion: boolean | undefined, classes: string[]) {
         this.rawKnown = motion !== undefined;
+        this.rawLast = { motion, classes };
         if (!this.id) return;
         const declared = this.nvr.channelCache(this.channel)?.aiClasses ?? [];
         const key = `${this.name}|${declared.join(',')}`;

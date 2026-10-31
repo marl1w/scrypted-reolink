@@ -137,6 +137,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             }
         }
         this.console.log(`discovered channels: ${all.join(', ') || 'none'}`);
+        for (const c of this.cameras.values()) c.rawRediscovered();
         this.storageSettings.values.channels = all.map(String);
         await this.syncDevices();
     }
