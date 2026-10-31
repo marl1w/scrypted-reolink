@@ -1,6 +1,6 @@
 # NVR recordings: design notes
 
-Each NVR channel camera implements Scrypted's standard **VideoClips** and **VideoRecorder** from the NVR's own recordings, so any consumer can list, play and download them without knowing it is a Reolink. The rules come from [Reolink Stamina](https://github.com/marl1w/reolink-stamina-ha), a Home Assistant integration that has been playing NVR recordings for a while. Most of them fix a failure that someone hit on real hardware. Each is listed below with how it is handled here.
+Each NVR channel camera implements Scrypted's standard **VideoClips** and **VideoRecorder** from the NVR's own recordings, so any consumer can list, play and download them without knowing it is a Reolink. The rules come from [an earlier Home Assistant integration](https://github.com/marl1w/reolink-stamina-ha) that has been playing NVR recordings for a while. Most of them fix a failure that someone hit on real hardware. Each is listed below with how it is handled here.
 
 Code: `src/recordings.ts` (pure rules, tested with fixtures), `src/recorder.ts` (one NVR: searches, cache, playback route, thumbnails), `src/camera.ts` (the Scrypted interfaces).
 
@@ -25,7 +25,7 @@ The FFmpegInput holds `-fflags +genpts`, an optional `-t <duration>` (and `-ss` 
 ## Safety limits
 
 - **Signed clip ids.** Clip ids are signed (HMAC-SHA256) with a random key kept in the NVR's plugin storage, and bound to their camera's channel. A name reaches a URL only in a shape seen on Reolink devices (NVR `<stream>-<channel>-<n>-<14 digits>-<5 digits>`, camera `Mp4Record/…/Rec…mp4`, or the 14-digit PlaybackTime of a row without a name); any other recording is still listed, and played by its PlaybackTime as the source.
-- **Playback slots.** Recording Playback Streams (NVR setting, Advanced, default 3): streams and thumbnails this plugin opens at once; past that, "NVR playback busy". Set it to the NVR's own limit minus what other consumers (the Reolink app, Home Assistant, Stamina) play back at the same time. The plugin cannot see a consumer end a stream, so leases are per camera and stream (the latest request replaces the previous one): a bounded recording stream counts for its duration plus 30 s (at most 10 minutes), an open stream or a clip (which may never be opened) for a minute. A lease is taken only once its URL exists. A thumbnail resolves the route before it takes its slot. Clips are at most a day long.
+- **Playback slots.** Recording Playback Streams (NVR setting, Advanced, default 3): streams and thumbnails this plugin opens at once; past that, "NVR playback busy". Set it to the NVR's own limit minus what other consumers (the Reolink app, Home Assistant, another consumer such as scrypted-stamina) play back at the same time. The plugin cannot see a consumer end a stream, so leases are per camera and stream (the latest request replaces the previous one): a bounded recording stream counts for its duration plus 30 s (at most 10 minutes), an open stream or a clip (which may never be opened) for a minute. A lease is taken only once its URL exists. A thumbnail resolves the route before it takes its slot. Clips are at most a day long.
 - **Token lifetime.** A playback token is renewed early unless it stays valid at least 10 minutes (or the asked duration plus a minute, capped at 50 minutes and at most of a lease). A token replaced while still valid is not logged out (URLs handed out keep working); it expires on its own, and every one still valid is logged out on stop.
 - **ffmpeg input.** Recording inputs start with `-protocol_whitelist http,tcp`. Error messages are scrubbed of URL queries, `user=` / `password=` / `token=` values, and the account password. A password with spaces, quotes or `#` cannot travel on `/flv` and is refused with a clear error; one with `&` is logged as a warning.
 - **Thumbnails.** One decode in flight per thumbnail, at most 20 waiting (the oldest is dropped), failures remembered for a minute, timeline thumbnails taken per 10 s. On the Download route they are taken at the start of the file, since seeking a whole file would read it up to the seek.
@@ -38,7 +38,7 @@ The FFmpegInput holds `-fflags +genpts`, an optional `-t <duration>` (and `-ss` 
   - HTTP: `Search` (files and status), `Playback`, `Download`, `GetTime`, `GetRecV20`;
   - Baichuan: 81, 199, 296, and 272/273/274 (alarm-video search).
 
-## Fixes carried over from Reolink Stamina
+## Fixes carried over from an earlier Home Assistant integration
 
 | # | Fix | Why | Here |
 |---|---|---|---|
@@ -78,9 +78,9 @@ A BinarySensor child per camera, **"<camera> Night mode"** (native id `<camera>-
 
 ## Camera motion
 
-A MotionSensor child per camera, **"<camera> Camera motion"** (native id `<camera>-rawmotion`, type Sensor). It carries the camera's raw motion level from each push, with no hold, no trigger rule and no day/night ignore: the same signal the MQTT add-on publishes as `motion`. While the connection is lost the level is unknown. The camera's own MotionSensor keeps its processed behaviour.
+A MotionSensor child per camera, **"<camera> Camera motion"** (native id `<camera>-rawmotion`, type Sensor). It carries the camera's raw motion level from each push, with no hold, no trigger rule and no day/night ignore: the same signal an MQTT bridge such as scrypted-mqtt-ha publishes as `motion`. While the connection is lost the level is unknown. The camera's own MotionSensor keeps its processed behaviour.
 
-Next to it, one OccupancySensor child per AI class the channel supports, **"<camera> Camera person"**, "Camera vehicle", "Camera animal" and so on (native id `<camera>-raw-<class>`, type Sensor). Each one's `occupied` is that class's raw level, unknown while disconnected. The class names are normalised as the MQTT add-on names its entities (people→person, dog_cat→animal), so the names match.
+Next to it, one OccupancySensor child per AI class the channel supports, **"<camera> Camera person"**, "Camera vehicle", "Camera animal" and so on (native id `<camera>-raw-<class>`, type Sensor). Each one's `occupied` is that class's raw level, unknown while disconnected. The class names are normalised to the usual names (people→person, dog_cat→animal), so they match other plugins' names.
 
 When the camera's last AI class clears, the camera emits one `ObjectsDetected` with no detections, so consumers turn classes off exactly instead of on a timeout. While classes are active it repeats them every second, as before.
 

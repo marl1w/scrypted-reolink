@@ -29,7 +29,7 @@ Each camera also implements Scrypted's VideoClips and VideoRecorder from the NVR
 
 - **Limits:** at most 3 playback streams and thumbnails at once per NVR (else "NVR playback busy"); clips are at most a day long; clip ids are signed per install and bound to their camera.
 
-Nothing is ever deleted on the NVR. See [docs/recordings.md](docs/recordings.md) for the design notes and the fixes they carry over from Reolink Stamina.
+Nothing is ever deleted on the NVR. See [docs/recordings.md](docs/recordings.md) for the design notes and the fixes they carry over from an earlier Home Assistant integration.
 
 ## What is inside
 
