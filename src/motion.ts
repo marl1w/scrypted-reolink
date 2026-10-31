@@ -17,6 +17,8 @@ export interface MotionSink {
     /** Class names exactly as the device reports them (people, vehicle, dog_cat, face, package). */
     detections(classes: string[]): void;
     dayNight?(mode: string): void;
+    /** The camera's own state as each push reports it, with no hold or trigger rule; undefined motion when the connection is lost. */
+    raw?(motion: boolean | undefined, classes: string[]): void;
 }
 
 /** Classes never reported as detections: "other" only means motion. */
@@ -47,6 +49,7 @@ export class MotionController {
         }
         const c = this.cfg();
         const classes = [...ev.ai].filter(a => !NON_DETECTION.has(a));
+        this.sink.raw?.(!!ev.motion, classes);
         const suppressed = c.trigger === 'AI Only' || (c.dayNightIgnoreMs > 0 && this.now() - this.lastDayNightAt < c.dayNightIgnoreMs);
         const raw = ev.motion && !suppressed;
         this.activeClasses = classes;
@@ -82,6 +85,7 @@ export class MotionController {
     reset() {
         this.activeClasses = [];
         this.stopRepeat();
+        this.sink.raw?.(undefined, []);
     }
 
     dispose() {

@@ -73,6 +73,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             this.console.log(`push ${s}`);
             this.online = s === 'subscribed';
             if (s !== 'subscribed') for (const c of this.cameras.values()) c.motion.reset();
+            else for (const c of this.cameras.values()) c.rawSubscribed();
             this.updateCameraOnline();
         });
         push.on('warn', e => this.console.warn(`push: ${e.message}`));

@@ -1,5 +1,6 @@
 import sdk, { Camera, DeviceProvider, EventListenerRegister, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { rawEntities, reolinkMqtt } from './mqtt';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
@@ -87,6 +88,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
                 sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, od);
             },
             dayNight: mode => { this.storageSettings.values.dayNight = mode; },
+            raw: (motion, classes) => this.publishRaw(motion, classes),
         });
         this.snapshots = new KeyframeCache({
             ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
@@ -102,6 +104,28 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     viewCrop() {
         return parseViewCrop(this.storageSettings.values.viewCrop);
+    }
+
+    private rawKnown = false;
+    private rawConfigKey = '';
+
+    /** Subscribed again: until the next push says otherwise, nothing is active. */
+    rawSubscribed() {
+        if (!this.rawKnown) this.publishRaw(false, []);
+    }
+
+    /** The camera's own motion and AI classes, exact, as entities of this camera in the Scrypted MQTT bridge. */
+    private publishRaw(motion: boolean | undefined, classes: string[]) {
+        this.rawKnown = motion !== undefined;
+        if (!this.id) return;
+        const declared = this.nvr.channelCache(this.channel)?.aiClasses ?? [];
+        const key = `${this.name}|${declared.join(',')}`;
+        if (key !== this.rawConfigKey) {
+            this.rawConfigKey = key;
+            reolinkMqtt.config(this.id, rawEntities(this.name || this.id, declared));
+        }
+        reolinkMqtt.state(this.id, 'motion', motion ?? null);
+        for (const c of declared) reolinkMqtt.state(this.id, c, motion === undefined ? null : classes.includes(c));
     }
 
     private viewOption(): ResponseMediaStreamOptions | undefined {

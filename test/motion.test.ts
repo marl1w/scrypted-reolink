@@ -73,3 +73,20 @@ test('raw motion right after a day/night switch is ignored when configured', asy
     assert.deepEqual(log, ['dn=night', 'motion=true']);
     m.dispose();
 });
+
+test('raw reports every push as the camera states it, ignoring trigger rules and holds, and unknown on reset', () => {
+    const raw: string[] = [];
+    const c: MotionConfig = { timeoutMs: 80, dayNightIgnoreMs: 60000, trigger: 'AI Only', repeatMs: 30 };
+    const m = new MotionController(() => c, {
+        setMotion: () => { },
+        detections: () => { },
+        raw: (motion, classes) => raw.push(`${motion}:${classes.join(',')}`),
+    });
+    m.handle(daynight('night'));
+    m.handle(alarm(true));
+    m.handle(alarm(true, ['people', 'other']));
+    m.handle(alarm(false));
+    m.reset();
+    assert.deepEqual(raw, ['true:', 'true:people', 'false:', 'undefined:']);
+    m.dispose();
+});

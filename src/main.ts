@@ -1,6 +1,7 @@
 import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from '@scrypted/sdk';
 import { randomBytes } from 'node:crypto';
 import packageJson from '../package.json';
+import { reolinkMqtt } from './mqtt';
 import { ReolinkNvr } from './nvr';
 
 class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator {
@@ -9,6 +10,7 @@ class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider
     constructor(nativeId?: string) {
         super(nativeId);
         this.console.log(`Reolink (Baichuan) ${packageJson.version} loaded`);
+        reolinkMqtt.start();
         const shutdown = () => { for (const n of this.nvrs.values()) void n.stop(); };
         process.once('SIGTERM', shutdown);
         process.once('beforeExit', shutdown);
