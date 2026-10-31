@@ -1,4 +1,9 @@
 import type { HttpRequest, HttpResponse } from '@scrypted/sdk';
+import { randomBytes } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { FileHandle, mkdir, open, rm, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { NvrRecordings } from './recorder';
 import { MediaLink, MediaLinkKind, mediaLinkQuery, parseMediaLink, scrubUrls, verifyMediaLink } from './recordings';
 
@@ -31,24 +36,38 @@ function sendError(res: HttpResponse, code: number, msg: string) {
     res.send(msg, { code, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
 
-/** A clip's bytes are kept this long after its last reader went away (then its ffmpeg is stopped, if still running). */
-const CLIP_KEEP_MS = 60_000;
-/** A clip stops being remuxed past this many bytes (hours of substream). */
+/** A clip's file is kept this long after its last reader went away (then its ffmpeg is stopped, if still running). */
+const CLIP_KEEP_MS = 10 * 60_000;
+/** A remux nobody has read for this long gives its NVR playback slot to a new clip that needs one. */
+const CLIP_EVICT_MS = 5_000;
+/** Clip files kept at most; past it the one unread the longest goes. */
+const MAX_SPOOLS = 4;
+/** A clip stops being remuxed past this many bytes (hours of substream); its length is then what was written. */
 const CLIP_MAX_BYTES = 256 * 1024 * 1024;
 
+let spoolDirReady: Promise<string> | undefined;
+/** Where clips are spooled, in the plugin's volume; emptied once per start (files left by a previous run). */
+function spoolDir(): Promise<string> {
+    const dir = join(process.env.SCRYPTED_PLUGIN_VOLUME || join(tmpdir(), 'scrypted-reolink'), 'clips');
+    spoolDirReady ??= rm(dir, { recursive: true, force: true }).then(() => mkdir(dir, { recursive: true })).then(() => dir)
+        .catch(e => { spoolDirReady = undefined; throw e; });
+    return spoolDirReady;
+}
+
 /**
- * A clip being remuxed, with every byte so far. A browser's <video> drops its connection when paused or off screen and
+ * A clip being remuxed, spooled to a file. A browser's <video> drops its connection when paused or off screen and
  * resumes later with `Range: bytes=N-`: a live remux alone cannot answer that, so the bytes are kept while it is read.
  */
-export class ClipBuffer {
-    private chunks: Buffer[] = [];
+export class ClipSpool {
     size = 0;
     done = false;
     private readers = 0;
+    /** When it was created or last read. */
+    usedAt = Date.now();
     private waiters: (() => void)[] = [];
     private idle?: ReturnType<typeof setTimeout>;
 
-    constructor(private clip: { stream: AsyncGenerator<Buffer, void>; stop: () => void }, private onIdle: () => void) {
+    constructor(private clip: { stream: AsyncGenerator<Buffer, void>; stop: () => void }, private file: string, private fh: FileHandle, private onIdle: () => void) {
         this.armIdle();
         void this.pump();
     }
@@ -56,15 +75,17 @@ export class ClipBuffer {
     private async pump() {
         try {
             for await (const b of this.clip.stream) {
-                this.chunks.push(b);
-                this.size += b.length;
+                const part = b.subarray(0, CLIP_MAX_BYTES - this.size);
+                await this.fh.write(part);
+                this.size += part.length;
                 this.wake();
-                if (this.size > CLIP_MAX_BYTES) break;
+                if (this.size >= CLIP_MAX_BYTES) break;
             }
         }
         catch { }
         finally {
             this.clip.stop();
+            await this.fh.close().catch(() => undefined);
             this.done = true;
             this.wake();
         }
@@ -80,71 +101,111 @@ export class ClipBuffer {
         this.idle.unref?.();
     }
 
-    stop() {
+    /** Nobody reads it, nor has for `ms`. */
+    idleFor(ms: number): boolean {
+        return this.readers === 0 && Date.now() - this.usedAt >= ms;
+    }
+
+    /** Stops its remux and deletes its file. */
+    remove() {
         clearTimeout(this.idle);
         this.clip.stop();
+        void unlink(this.file).catch(() => undefined);
     }
 
-    get idleNow() {
-        return this.readers === 0;
+    /** Resolves once a byte at `pos` is written, or the clip is complete. */
+    async until(pos: number) {
+        while (!this.done && this.size <= pos) await new Promise<void>(r => this.waiters.push(r));
     }
 
-    /** The bytes from `from` on, following the remux until it ends (or only up to `end`, inclusive, when given). */
-    async *read(from: number, end = Infinity): AsyncGenerator<Buffer, void> {
+    /** The bytes from `from` on, following the remux until it ends (or only up to `end`, inclusive). A reader from now on. */
+    read(from: number, end = Infinity): AsyncGenerator<Buffer, void> {
         this.readers++;
+        this.usedAt = Date.now();
+        return this.reader(from, end);
+    }
+
+    private async *reader(from: number, end: number): AsyncGenerator<Buffer, void> {
         try {
-            let pos = 0, i = 0;
+            let pos = from;
             while (true) {
-                for (; i < this.chunks.length && pos <= end; pos += this.chunks[i++].length) {
-                    const c = this.chunks[i], a = Math.max(0, from - pos), b = Math.min(c.length, end + 1 - pos);
-                    if (a < b) yield a === 0 && b === c.length ? c : c.subarray(a, b);
+                const stop = Math.min(end + 1, this.size);
+                if (pos < stop) {
+                    for await (const c of createReadStream(this.file, { start: pos, end: stop - 1 })) {
+                        pos += (c as Buffer).length;
+                        yield c as Buffer;
+                    }
                 }
-                if (this.done || pos > end) return;
-                await new Promise<void>(r => this.waiters.push(r));
+                if (pos > end || (this.done && pos >= this.size)) return;
+                await this.until(pos);
             }
         }
         finally {
             this.readers--;
+            this.usedAt = Date.now();
             this.armIdle();
         }
     }
 }
 
-/** Clips being served, by link (NVR, channel, clip). */
-export const clipBuffers = new Map<string, ClipBuffer>();
+/** Clips being served, by link (NVR, channel, clip), and the ones starting. */
+export const clipSpools = new Map<string, ClipSpool>();
+const starting = new Map<string, Promise<ClipSpool>>();
 
-/**
- * The clip's buffer, starting its remux when there is none. A fresh one drops the clips nobody is reading, so their
- * ffmpeg gives its NVR playback slot back at once (one viewer moves from clip to clip).
- */
-async function clipBuffer(key: string, r: NvrRecordings, channel: number, clipId: string): Promise<ClipBuffer> {
-    const had = clipBuffers.get(key);
-    if (had) return had;
-    for (const [k, b] of clipBuffers) {
-        if (!b.idleNow) continue;
-        b.stop();
-        clipBuffers.delete(k);
+/** Removes the clip unread the longest among those `which` accepts, if one has been unread for CLIP_EVICT_MS. */
+function evictOne(which: (s: ClipSpool) => boolean): boolean {
+    let oldest: [string, ClipSpool] | undefined;
+    for (const e of clipSpools)
+        if (which(e[1]) && e[1].idleFor(CLIP_EVICT_MS) && (!oldest || e[1].usedAt < oldest[1].usedAt)) oldest = e;
+    if (!oldest) return false;
+    oldest[1].remove();
+    clipSpools.delete(oldest[0]);
+    return true;
+}
+
+/** The clip's spool, starting its remux when there is none (once, however many requests ask at the same time). */
+function clipSpool(key: string, r: NvrRecordings, channel: number, clipId: string): Promise<ClipSpool> {
+    const had = clipSpools.get(key);
+    if (had) return Promise.resolve(had);
+    let p = starting.get(key);
+    if (!p) {
+        p = startSpool(key, r, channel, clipId).finally(() => starting.delete(key));
+        starting.set(key, p);
     }
-    const clip = await r.clipMp4(channel, clipId);
-    // another request may have started the same clip meanwhile
-    const raced = clipBuffers.get(key);
-    if (raced) {
-        clip.stop();
-        return raced;
+    return p;
+}
+
+async function startSpool(key: string, r: NvrRecordings, channel: number, clipId: string): Promise<ClipSpool> {
+    const dir = await spoolDir();
+    let clip;
+    while (true) {
+        try {
+            clip = await r.clipMp4(channel, clipId);
+            break;
+        }
+        catch (e) {
+            // the NVR's slots are taken: a remux nobody watches gives its slot back (one viewer moves from clip to clip)
+            if (!/playback busy/.test((e as Error).message) || !evictOne(s => !s.done)) throw e;
+        }
     }
-    const b: ClipBuffer = new ClipBuffer(clip, () => {
-        b.stop();
-        if (clipBuffers.get(key) === b) clipBuffers.delete(key);
+    while (clipSpools.size >= MAX_SPOOLS && evictOne(() => true));
+    const file = join(dir, `${randomBytes(8).toString('hex')}.mp4`);
+    let fh: FileHandle;
+    try { fh = await open(file, 'w'); }
+    catch (e) { clip.stop(); throw e; }
+    const s: ClipSpool = new ClipSpool(clip, file, fh, () => {
+        s.remove();
+        if (clipSpools.get(key) === s) clipSpools.delete(key);
     });
-    clipBuffers.set(key, b);
-    return b;
+    clipSpools.set(key, s);
+    return s;
 }
 
 /**
  * Serves a signed clip (fragmented MP4, streamed while the NVR plays it back) or clip thumbnail (JPEG). Answers false
- * when the path is not one of these. A clip's bytes are kept while it is read (see ClipBuffer), so `Range: bytes=N-`
- * is served from them; once the whole clip is in, it has a length and any range is served. A browser's
- * `Range: bytes=0-1` probe of a clip not started yet gets two bytes without opening the NVR.
+ * when the path is not one of these. A clip is spooled while it is read (see ClipSpool): a range is served from the
+ * bytes written so far, with the length once the clip is complete. A browser's `Range: bytes=0-1` probe of a clip not
+ * started yet gets two bytes without opening the NVR.
  */
 export async function handleMediaRequest(req: HttpRequest, res: HttpResponse, nvr: (nativeId: string) => MediaHost | undefined, now = Date.now): Promise<boolean> {
     const u = new URL(req.url ?? '/', 'http://localhost');
@@ -174,50 +235,46 @@ export async function handleMediaRequest(req: HttpRequest, res: HttpResponse, nv
         }
         r.decodeClip(link.channel, link.clipId);
         const key = `${link.nvr}|${link.channel}|${link.clipId}`;
-        const headers = { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store' };
-        const rangeHeader = String(req.headers?.range ?? req.headers?.Range ?? '').trim();
-        const m = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader);
-        if (rangeHeader && !m) {
-            res.send('', { code: 416, headers: { ...headers, 'Content-Range': 'bytes */*' } });
-            return true;
-        }
-        const from = m ? Number(m[1]) : 0, to = m?.[2] ? Number(m[2]) : undefined;
-        let b = clipBuffers.get(key);
-        if (!b && m && from === 0 && to === 1) {
+        const headers = { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store', 'Accept-Ranges': 'bytes' };
+        const m = /^bytes=(\d+)-(\d*)$/.exec(String(req.headers?.range ?? req.headers?.Range ?? '').trim());
+        // an unparseable range, or one ending before it starts, is ignored (RFC 9110, 14.2)
+        const range = m && (!m[2] || Number(m[2]) >= Number(m[1])) ? { from: Number(m[1]), to: m[2] ? Number(m[2]) : Infinity } : undefined;
+        let s = clipSpools.get(key);
+        const fresh = !s && !starting.has(key);
+        if (fresh && range?.from === 0 && range.to === 1) {
             // an MP4 starts with the size of its ftyp box, under 64 KiB: two zero bytes
             res.send(Buffer.alloc(2), { code: 206, headers: { ...headers, 'Content-Range': 'bytes 0-1/*' } });
             return true;
         }
         if (req.method === 'HEAD') {
-            res.send('', { headers: { ...headers, 'Accept-Ranges': b?.done ? 'bytes' : 'none', ...b?.done ? { 'Content-Length': String(b.size) } : {} } });
+            res.send('', { headers: { ...headers, ...s?.done ? { 'Content-Length': String(s.size) } : {} } });
             return true;
         }
-        if (!b && from > 0) {
-            res.send('', { code: 416, headers: { ...headers, 'Content-Range': 'bytes */*' } });
+        if (fresh && range && range.from > 0) {
+            // nothing to resume from; the length is not known
+            res.send('', { code: 416, headers });
             return true;
         }
-        b ??= await clipBuffer(key, r, link.channel, link.clipId);
-        if (b.done) {
-            const last = Math.min(to ?? Infinity, b.size - 1);
-            if (from > last) {
-                res.send('', { code: 416, headers: { ...headers, 'Content-Range': `bytes */${b.size}` } });
-                return true;
-            }
-            const whole = !m;
-            res.sendStream(b.read(from, last), {
-                code: whole ? 200 : 206,
-                headers: { ...headers, 'Accept-Ranges': 'bytes', 'Content-Length': String(last - from + 1), ...whole ? {} : { 'Content-Range': `bytes ${from}-${last}/${b.size}` } },
-            });
+        s ??= await clipSpool(key, r, link.channel, link.clipId);
+        if (!range || (!s.done && range.from === 0 && range.to === Infinity)) {
+            // the whole clip: with its length once complete, else following the remux (no end can be promised yet)
+            res.sendStream(s.read(0), { headers: { ...headers, ...s.done ? { 'Content-Length': String(s.size) } : {} } });
             return true;
         }
-        if (from > b.size) {
-            res.send('', { code: 416, headers: { ...headers, 'Content-Range': 'bytes */*' } });
+        if (!s.done && range.from > s.size) {
+            res.send('', { code: 416, headers });
             return true;
         }
-        // still being remuxed: the length is not known yet, so a resumed range runs to the end of what comes
-        res.sendStream(b.read(from, to), {
-            code: from > 0 ? 206 : 200,
-            headers: { ...headers, 'Accept-Ranges': 'none', ...from > 0 ? { 'Content-Range': `bytes ${from}-${to ?? from + CLIP_MAX_BYTES}/*` } : {} },
+        await s.until(range.from);
+        if (range.from >= s.size) {
+            res.send('', { code: 416, headers: { ...headers, 'Content-Range': `bytes */${s.size}` } });
+            return true;
+        }
+        // what is written so far; a browser asks for the rest when it gets there
+        const last = Math.min(range.to, s.size - 1);
+        res.sendStream(s.read(range.from, last), {
+            code: 206,
+            headers: { ...headers, 'Content-Length': String(last - range.from + 1), 'Content-Range': `bytes ${range.from}-${last}/${s.done ? s.size : '*'}` },
         });
     }
     catch (e) {

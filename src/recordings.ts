@@ -537,6 +537,8 @@ export const THUMBNAIL_WIDTH = 320;
  * the NVR sends at 1x. 0 would mean ffmpeg's default, hence a small value.
  */
 export const FAST_PROBE_ARGS = ['-analyzeduration', '300000', '-probesize', '500000'];
+/** Probing limits of a served clip, as FAST_PROBE_ARGS but up to 1 s and 1 MB. */
+export const CLIP_PROBE_ARGS = ['-analyzeduration', '1000000', '-probesize', '1000000'];
 
 /**
  * One small JPEG of the first frame of an input. `fast` probes only the first packets (about a second instead of six
@@ -551,7 +553,7 @@ export function thumbnailArgs(input: string[], width = THUMBNAIL_WIDTH, fast = t
  * video track and the first audio track if any.
  */
 export function clipMp4Args(input: string[]): string[] {
-    return ['-hide_banner', '-loglevel', 'error', '-nostdin', '-analyzeduration', '1000000', '-probesize', '1000000', ...input,
+    return ['-hide_banner', '-loglevel', 'error', '-nostdin', ...CLIP_PROBE_ARGS, ...input,
         '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
 }
 

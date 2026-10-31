@@ -431,21 +431,26 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         return sdk.mediaManager.createFFmpegMediaObject(ff);
     }
 
-    /** An absolute, signed link to a clip or its thumbnail, served by the plugin on its local endpoint. */
-    private async mediaLink(kind: MediaLinkKind, clipId: string): Promise<string> {
-        const base = await sdk.endpointManager.getLocalEndpoint(undefined, { public: true });
-        return mediaLink(base, { kind, nvr: this.nvr.nativeId!, channel: this.channel, clipId, exp: linkExpiry(Date.now()) }, this.nvr.clipKey());
+    /**
+     * Signed links to clips and their thumbnails, served by the plugin: below its endpoint path (for Scrypted's UI,
+     * which loads them from its own origin), or `absolute` on its local endpoint. Undefined when Scrypted gives none.
+     */
+    private async mediaLinks(absolute = false): Promise<((kind: MediaLinkKind, clipId: string) => string) | undefined> {
+        const em = sdk.endpointManager;
+        const base = await (absolute ? em.getLocalEndpoint(undefined, { public: true }) : em.getPath(undefined, { public: true }))
+            .catch(e => { this.console.warn(`clip links: no plugin endpoint: ${(e as Error).message}`); return undefined; });
+        if (!base) return undefined;
+        const key = this.nvr.clipKey(), exp = linkExpiry(Date.now());
+        return (kind, clipId) => mediaLink(base, { kind, nvr: this.nvr.nativeId!, channel: this.channel, clipId, exp }, key);
     }
 
     async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
         const clips = await this.recorder().clips(this.channel, { startTime: options?.startTime, endTime: options?.endTime, count: options?.count });
         // Scrypted's UI plays resources.video and shows resources.thumbnail directly (it never asks for the media objects)
-        const base = await sdk.endpointManager.getPath(undefined, { public: true }).catch(() => undefined);
-        const key = this.nvr.clipKey(), exp = linkExpiry(Date.now());
-        const link = (kind: MediaLinkKind, clipId: string) => base ? { href: mediaLink(base, { kind, nvr: this.nvr.nativeId!, channel: this.channel, clipId, exp }, key) } : undefined;
+        const link = await this.mediaLinks();
         return clips.map(c => ({
             ...c, thumbnailId: c.id, videoId: c.id,
-            resources: base ? { thumbnail: link('thumb', c.id), video: link('clip', c.id) } : undefined,
+            resources: link ? { thumbnail: { href: link('thumb', c.id) }, video: { href: link('clip', c.id) } } : undefined,
         }));
     }
 
@@ -455,8 +460,11 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
      * a local URL (what Scrypted's UI asks for) and a URL, both the plugin's local endpoint.
      */
     async getVideoClip(videoId: string): Promise<MediaObject> {
+        // throws on an id that is forged or of another camera: no link is signed for it
         this.recorder().decodeClip(this.channel, videoId);
-        const url = await this.mediaLink('clip', videoId);
+        const link = await this.mediaLinks(true);
+        if (!link) throw new Error('clip unavailable: the plugin has no endpoint');
+        const url = link('clip', videoId);
         return sdk.mediaManager.createMediaObject(Buffer.from(url), 'video/mp4', {
             sourceId: this.id,
             toMimeTypes: [ScryptedMimeTypes.LocalUrl, ScryptedMimeTypes.Url],

@@ -14,10 +14,6 @@ import { NvrRecordings } from './recorder';
 import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
-
-function thumbnailInfo(t: { fast: number; fallback: number; reopened: number; lastMiss: string; lastError: string }): string {
-    return `${t.fast} fast (${t.reopened} asked twice), ${t.fallback} with default probing since start${t.lastMiss ? ` · last fast-probe miss: ${t.lastMiss}` : ''}${t.lastError ? ` · last failure: ${t.lastError}` : ''}`;
-}
 const NVR_IDS = 'nvrIds';
 /** Smart AI support bits per channel (Baichuan cmd 199 `smartAI`), JSON `{ "<channel>": bits }`. */
 const SMART_AI = 'smartAi';
@@ -407,7 +403,6 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         });
         return [
             { key: 'health', title: 'Health', readonly: true, value: health },
-            ...this.recordings ? [{ key: 'thumbnailInfo', title: 'Recording Thumbnails', readonly: true, subgroup: 'Advanced', value: thumbnailInfo(this.recordings.thumbStats) }] : [],
             ...await this.storageSettings.getSettings(),
         ];
     }

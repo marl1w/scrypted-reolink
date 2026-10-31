@@ -156,8 +156,8 @@ test('thumbnails: one small JPEG per key from ffmpeg, cached; a failure says why
     const runFfmpeg = async (_p: string, args: string[]) => { runs.push(args); return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); };
     await withRecorder(async r => {
         const clip = (await r.clips(0, { startTime: Date.parse('2026-10-30T00:00:00Z'), endTime: Date.parse('2026-10-30T22:00:00Z') }))[0];
-        const a = await r.thumbnail(clip.id, () => r.clipInput(0, clip.id));
-        const b = await r.thumbnail(clip.id, () => r.clipInput(0, clip.id));
+        const a = await r.clipThumbnail(0, clip.id);
+        const b = await r.clipThumbnail(0, clip.id);
         assert.equal(a, b);
         assert.equal(runs.length, 1);
         assert.ok(runs[0].includes('scale=320:-2'));
@@ -279,7 +279,7 @@ test('playback slots: per channel and stream, latest wins, capped by the setting
         await r.input(0, at.row, at.seek);
         await r.input(0, at.row, at.seek);
         assert.ok(await r.input(1, at.row, at.seek, 20));
-        assert.ok(await r.input(2, at.row, at.seek, 20, { clip: true }));
+        assert.ok(await r.input(2, at.row, at.seek, 20));
         await assert.rejects(r.input(3, at.row, at.seek, 20), /NVR playback busy: 3/);
         assert.ok(await r.input(2, at.row, at.seek), 'the same camera and stream replaces its own lease');
         slots = 4;
@@ -392,7 +392,7 @@ test('thumbnails probe only the first packets; a miss falls back to ffmpeg\'s de
         assert.equal((await r.thumbnail('a', input, 3))[0], 0xff);
         assert.equal(runs.length, 2);
         assert.ok(runs.every(a => a.includes('-analyzeduration')));
-    }, { runFfmpeg: async (_p: string, args: string[]) => { runs.push(args); if (closes-- > 0) throw new Error('thumbnail failed: Error opening input: End of file'); return Buffer.from([0xff, 0xd8]); } });
+    }, { thumbnailRetryMs: 1, runFfmpeg: async (_p: string, args: string[]) => { runs.push(args); if (closes-- > 0) throw new Error('thumbnail failed: Error opening input: End of file'); return Buffer.from([0xff, 0xd8]); } });
     // an NVR error is not retried
     runs.length = 0;
     await withRecorder(async r => {
@@ -400,6 +400,33 @@ test('thumbnails probe only the first packets; a miss falls back to ffmpeg\'s de
         await assert.rejects(r.thumbnail('a', input, 3), /404/);
         assert.equal(runs.length, 1);
     }, { runFfmpeg: async (_p: string, args: string[]) => { runs.push(args); throw new Error('thumbnail failed: Server returned 404 Not Found'); } });
+});
+
+test('thumbnails: a closed stream waits its back-off off the worker; streams closed again and again pause thumbnails', async () => {
+    const order: string[] = [];
+    const logs: string[] = [];
+    let closeAll = false;
+    await withRecorder(async r => {
+        const input = (k: string) => async () => ({ route: 'playback' as const, url: k, container: 'flv', inputArguments: ['-i', k] });
+        // one worker (2 slots): b decodes while a waits to be asked again
+        await Promise.all([r.thumbnail('a', input('a')), r.thumbnail('b', input('b'))]);
+        assert.deepEqual(order, ['a', 'b', 'a']);
+        closeAll = true;
+        const res = await Promise.all(['c', 'd'].map(k => r.thumbnail(k, input(k)).then(() => 'ok', e => (e as Error).message)));
+        assert.ok(res.every(m => /End of file|paused/.test(m)), 'gave up');
+        assert.ok(logs.some(l => /thumbnails paused/.test(l)));
+        const runs = order.length;
+        await assert.rejects(r.thumbnail('e', input('e')), /thumbnails paused/);
+        assert.equal(order.length, runs, 'paused: no ffmpeg');
+    }, {
+        slots: () => 2, thumbnailRetryMs: 20, log: m => logs.push(m),
+        runFfmpeg: async (_p: string, args: string[]) => {
+            const k = args[args.indexOf('-i') + 1];
+            order.push(k);
+            if (closeAll || (k === 'a' && order.length === 1)) throw new Error('thumbnail failed: Error opening input: End of file');
+            return Buffer.from([0xff, 0xd8]);
+        },
+    });
 });
 
 test('thumbnails on the Download route are taken at the start of the file', () => withRecorder(async r => {
@@ -524,16 +551,7 @@ test('served clip: a client that goes away kills ffmpeg and frees the slot', () 
     assert.equal(slotFree(r), true);
 }));
 
-test('served clip: a consumer that stops reading is timed out; ffmpeg failing first frees the slot and says why', async () => {
-    await withClip(async (r, procs, id) => {
-        const opening = r.clipMp4(0, id);
-        await spawned(procs);
-        procs[0].stdout.write(Buffer.from('ftyp'));
-        await opening; // never read: the generator waits at its first chunk
-        for (let i = 0; i < 50 && !procs[0].killed; i++) await new Promise(res => setTimeout(res, 5));
-        assert.equal(procs[0].killed, 1, 'idle consumer: killed');
-        assert.equal(slotFree(r), true);
-    }, { clipLimits: { idleMs: 10, checkMs: 5 }, now: (() => { const t0 = Date.now(); return () => Date.parse('2026-10-31T12:00:00Z') + Date.now() - t0; })() });
+test('served clip: ffmpeg failing first frees the slot and says why', async () => {
     await withClip(async (r, procs, id) => {
         const opening = r.clipMp4(0, id);
         await spawned(procs);

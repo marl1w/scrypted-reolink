@@ -3,10 +3,10 @@ import { request as httpRequest } from 'node:http';
 import { Cmd } from './baichuan/constants';
 import type { NvrApi } from './http/nvr-api';
 import {
-    AlarmVideo, alarmVideoHandleXml, alarmVideoOpenXml, buildClips, ClipInfo, ClipRef, decodeClipId, downloadUrl, flvUrl,
-    isContinuousDay, MAX_CLIP_SECONDS, parseAlarmVideos, parseFileHandle, parseSearchFiles, playbackIsUtc, playbackUrl, PlaybackRoute,
-    PlaybackTarget, RecorderZone, recorderDay, recorderDays, recordingInputArgs, RecordingFile, RecordingStreamType,
-    reolinkTime, ROUTE_ORDER, scrubUrls, splitRecordings, thumbnailArgs, clipMp4Args,
+    AlarmVideo, alarmVideoHandleXml, alarmVideoOpenXml, buildClips, ClipInfo, clipMp4Args, ClipRef, decodeClipId, downloadUrl,
+    flvUrl, isContinuousDay, MAX_CLIP_SECONDS, parseAlarmVideos, parseFileHandle, parseSearchFiles, PlaybackRoute, PlaybackTarget,
+    playbackIsUtc, playbackUrl, recorderDay, recorderDays, RecorderZone, RecordingFile, recordingInputArgs, RecordingStreamType,
+    reolinkTime, ROUTE_ORDER, scrubUrls, splitRecordings, thumbnailArgs,
 } from './recordings';
 
 // One NVR's recordings: searches (cached, coalesced and one at a time, as the NVR is slow and its HTTP pool small),
@@ -55,9 +55,7 @@ const THUMBNAIL_CACHE = 64;
 export const THUMBNAIL_QUEUE = 64;
 /** Thumbnails decoded at once per NVR, always leaving one playback slot free for real playback. */
 export const THUMBNAIL_PARALLEL = 2;
-/** A served clip's ffmpeg is killed when its consumer has not read for this long (a client that went away). */
-const CLIP_IDLE_MS = 60_000;
-/** ...or the NVR sent nothing for this long. */
+/** A served clip's ffmpeg is killed when the NVR sent nothing for this long. */
 const CLIP_STALL_MS = 30_000;
 /** ...or after the clip's length plus this (the NVR plays back at 1x), at most CLIP_MAX_MS. */
 const CLIP_GRACE_MS = 120_000;
@@ -67,6 +65,9 @@ const THUMBNAIL_FAIL_TTL_MS = 60_000;
 /** A thumbnail stream the NVR closed at once is asked again, up to this many times, after 0.5 s, 1 s... */
 const THUMBNAIL_REOPENS = 3;
 const THUMBNAIL_RETRY_MS = 500;
+/** After this many streams in a row the NVR closed at once, thumbnails fail at once for THUMBNAIL_PAUSE_MS. */
+const THUMBNAIL_BREAKER = 6;
+const THUMBNAIL_PAUSE_MS = 60_000;
 /** The alarm-video search is paged; reolink_aio stops after this many pages. */
 const MAX_ALARM_PAGES = 50;
 /** A gap this short before a recording starts is played from that recording's start. */
@@ -103,8 +104,10 @@ export interface RecorderDeps {
     probe?: (url: string, timeoutMs: number) => Promise<number>;
     runFfmpeg?: (ffmpeg: string, args: string[], timeoutMs: number) => Promise<Buffer>;
     spawnFfmpeg?: (ffmpeg: string, args: string[]) => ChildProcessWithoutNullStreams;
-    /** Served clip watchdog: idle, stall and check interval, ms (tests shorten them). */
-    clipLimits?: { idleMs?: number; stallMs?: number; checkMs?: number };
+    /** Served clip watchdog: stall and check interval, ms (tests shorten them). */
+    clipLimits?: { stallMs?: number; checkMs?: number };
+    /** First back-off before a thumbnail stream the NVR closed is asked again (default THUMBNAIL_RETRY_MS). */
+    thumbnailRetryMs?: number;
 }
 
 interface DayRecord {
@@ -130,7 +133,14 @@ export interface ClipQuery {
 }
 
 interface ThumbJob {
-    run: () => Promise<Buffer>;
+    key: string;
+    input: () => Promise<RecordingInput>;
+    channel?: number;
+    /** the input's ffmpeg arguments, once resolved */
+    args?: string[];
+    /** probing only the first packets (cleared for the fallback), and how often the stream was asked again */
+    fast: boolean;
+    reopens: number;
     resolve: (b: Buffer) => void;
     reject: (e: Error) => void;
 }
@@ -158,8 +168,10 @@ export class NvrRecordings {
     private thumbInflight = new Map<string, Promise<Buffer>>();
     private thumbJobs: ThumbJob[] = [];
     private thumbActive = 0;
-    /** Thumbnails taken with the fast probe, and with ffmpeg's default probing after the fast one missed (diagnostics). */
-    thumbStats = { fast: 0, fallback: 0, reopened: 0, lastMiss: '', lastError: '' };
+    /** Streams the NVR closed at once in a row, and until when thumbnails then fail at once. */
+    private thumbCloses = 0;
+    private thumbPausedUntil = 0;
+    private fallbackLogs = 0;
     private warnedAmp = false;
     searches = 0;
     alarmSearches = 0;
@@ -457,11 +469,11 @@ export class NvrRecordings {
     /**
      * ffmpeg input for a recording from `seek` seconds in, bounded to `duration` seconds (at most a day) when given.
      * Each handed-out stream takes a playback slot, one per channel and stream (latest wins): a bounded recording
-     * stream for about its length, an open one or a clip (which may never be opened) for a minute. A thumbnail input
-     * or a `held` one takes no lease (the thumbnail or the served clip holds a slot while it runs); on the Download route it starts at the file's
-     * beginning, as seeking a whole file would read it up to the seek. `verified`: the row was just listed by the NVR.
+     * stream for about its length, an open one for a minute. A thumbnail input or a `held` one takes no lease (the
+     * thumbnail or the served clip holds a slot while it runs); a thumbnail input on the Download route starts at the
+     * file's beginning, as seeking a whole file would read it up to the seek. `verified`: the row was just listed by the NVR.
      */
-    async input(channel: number, rec: RecordingRef, seek: number, duration?: number, opts: { thumbnail?: boolean; clip?: boolean; verified?: boolean; held?: boolean } = {}): Promise<RecordingInput> {
+    async input(channel: number, rec: RecordingRef, seek: number, duration?: number, opts: { thumbnail?: boolean; verified?: boolean; held?: boolean } = {}): Promise<RecordingInput> {
         const d = duration && duration > 0 ? Math.min(duration, MAX_CLIP_SECONDS) : undefined;
         const tg = this.deps.target();
         const t: PlaybackTarget = { host: tg.host, port: tg.port, channel, ...rec, seek };
@@ -474,14 +486,8 @@ export class NvrRecordings {
         const url = await this.url(route, { ...t, seek: route === 'download' ? 0 : seek }, d ? d * 1000 + 60_000 : TOKEN_MIN_MS);
         // the lease only once the URL exists: a failure above holds no slot
         if (lease)
-            this.leases.set(leaseKey, this.now() + (opts.clip || !d ? LEASE_OPEN_MS : Math.min(d * 1000 + LEASE_GRACE_MS, LEASE_MAX_MS)));
+            this.leases.set(leaseKey, this.now() + (!d ? LEASE_OPEN_MS : Math.min(d * 1000 + LEASE_GRACE_MS, LEASE_MAX_MS)));
         return { route, url, container: route === 'download' ? 'mp4' : 'flv', inputArguments: recordingInputArgs(route, url, seek, d) };
-    }
-
-    /** ffmpeg input of a clip id of this channel. */
-    async clipInput(channel: number, id: string): Promise<RecordingInput> {
-        const c = this.decodeClip(channel, id);
-        return this.input(channel, c, c.offset, c.duration || undefined, { clip: true });
     }
 
     /** Takes one of the NVR's playback slots until the returned release is called (once; later calls do nothing). */
@@ -499,8 +505,7 @@ export class NvrRecordings {
     /**
      * A clip of this channel as fragmented MP4, remuxed by ffmpeg from the NVR's playback stream, for a browser. It
      * holds a playback slot while it runs (no lease: the end is seen here), released when ffmpeg ends, fails or is
-     * killed: on `stop()`, when the consumer stops reading for CLIP_IDLE_MS (it went away without saying so), when the
-     * NVR sends nothing for CLIP_STALL_MS, or past the clip's length plus CLIP_GRACE_MS. Resolves once the first bytes
+     * killed: on `stop()` (or when the consumer stops iterating), when the NVR sends nothing for CLIP_STALL_MS, or past the clip's length plus CLIP_GRACE_MS. Resolves once the first bytes
      * are there, so a failure can still be answered as one; throws "NVR playback busy" when no slot is free.
      */
     async clipMp4(channel: number, id: string): Promise<{ stream: AsyncGenerator<Buffer, void>; stop: () => void }> {
@@ -513,7 +518,7 @@ export class NvrRecordings {
         let p: ChildProcessWithoutNullStreams;
         try { p = (this.deps.spawnFfmpeg ?? spawnFfmpeg)(ffmpeg, clipMp4Args(input.inputArguments)); }
         catch (e) { release(); throw e; }
-        let err = '', ended = false, lastData = this.now(), waitingSince: number | undefined;
+        let err = '', ended = false, lastData = this.now();
         const stop = () => {
             if (ended) return;
             ended = true;
@@ -525,8 +530,7 @@ export class NvrRecordings {
         const deadline = setTimeout(stop, Math.min((d ?? 0) * 1000 + CLIP_GRACE_MS, CLIP_MAX_MS));
         const lim = this.deps.clipLimits;
         const watchdog = setInterval(() => {
-            const now = this.now();
-            if (waitingSince !== undefined ? now - waitingSince > (lim?.idleMs ?? CLIP_IDLE_MS) : now - lastData > (lim?.stallMs ?? CLIP_STALL_MS)) stop();
+            if (this.now() - lastData > (lim?.stallMs ?? CLIP_STALL_MS)) stop();
         }, lim?.checkMs ?? 5000);
         // neither keeps the process alive
         deadline.unref?.();
@@ -539,9 +543,7 @@ export class NvrRecordings {
             try {
                 for await (const b of p.stdout as AsyncIterable<Buffer>) {
                     lastData = now();
-                    waitingSince = lastData;
                     yield b;
-                    waitingSince = undefined;
                 }
             }
             finally { stop(); }
@@ -581,7 +583,7 @@ export class NvrRecordings {
         let p = this.thumbInflight.get(key);
         if (p) return p;
         p = new Promise<Buffer>((resolve, reject) => {
-            this.thumbJobs.push({ resolve, reject, run: () => this.runThumbnail(key, input, channel) });
+            this.thumbJobs.push({ key, input, channel, fast: true, reopens: 0, resolve, reject });
             while (this.thumbJobs.length > THUMBNAIL_QUEUE) this.thumbJobs.shift()!.reject(new Error('thumbnail dropped: too many waiting'));
             this.pumpThumbnails();
         }).finally(() => this.thumbInflight.delete(key));
@@ -599,72 +601,72 @@ export class NvrRecordings {
         while (this.thumbActive < this.thumbnailParallel() && this.thumbJobs.length) {
             const job = this.thumbJobs.shift()!;
             this.thumbActive++;
-            job.run().then(job.resolve, job.reject).finally(() => {
-                this.thumbActive--;
-                this.pumpThumbnails();
-            });
+            this.thumbAttempt(job)
+                .then(jpeg => jpeg && job.resolve(jpeg), e => job.reject(this.thumbFailed(job.key, e as Error)))
+                .finally(() => {
+                    this.thumbActive--;
+                    this.pumpThumbnails();
+                });
         }
     }
 
-    private keepThumbnail(key: string, jpeg: Buffer): Buffer {
-        this.thumbs.set(key, jpeg);
-        while (this.thumbs.size > THUMBNAIL_CACHE) this.thumbs.delete(this.thumbs.keys().next().value!);
-        return jpeg;
+    /** Back in the queue, first, after `ms`: the worker is free meanwhile. */
+    private requeueThumbnail(job: ThumbJob, ms: number) {
+        const t = setTimeout(() => {
+            this.thumbJobs.unshift(job);
+            this.pumpThumbnails();
+        }, ms);
+        t.unref?.();
     }
 
-    private async runThumbnail(key: string, input: () => Promise<RecordingInput>, channel?: number): Promise<Buffer> {
+    /** One decode of a job: its JPEG, or undefined when the job went back in the queue to be tried again. */
+    private async thumbAttempt(job: ThumbJob): Promise<Buffer | undefined> {
+        if (this.now() < this.thumbPausedUntil) throw new Error('thumbnails paused: the NVR keeps closing playback streams');
+        // the input first: a route measurement takes its own slot, released before the decode takes one
+        job.args ??= (await job.input()).inputArguments;
+        const ffmpeg = await this.deps.ffmpegPath();
         try {
-            // the input first: a route measurement takes its own slot, released before the decode takes one
-            const inputArgs = (await input()).inputArguments;
-            const ffmpeg = await this.deps.ffmpegPath();
-            const run = async (fast: boolean) => {
-                const jpeg = await this.withSlot(() => (this.deps.runFfmpeg ?? runFfmpeg)(ffmpeg, thumbnailArgs(inputArgs, undefined, fast), THUMBNAIL_TIMEOUT_MS));
-                if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error('thumbnail failed: ffmpeg produced no JPEG');
-                return jpeg;
-            };
-            let jpeg: Buffer;
-            try {
-                jpeg = await run(true);
-                this.thumbStats.fast++;
-            }
-            catch (e) {
-                // the fast probe may miss the first frame (a stream starting between keyframes, H.265): ffmpeg's
-                // default probing once more, unless the NVR itself failed (an HTTP error, no stream, a busy NVR). An
-                // NVR that closed the stream at once (seen right after a route probe) is asked again as it was.
-                const m = (e as Error).message;
-                if (!/^thumbnail failed/.test(m) || /Server returned|did not finish|playback busy/.test(m)) throw e;
-                const closed = (msg: string) => /Error opening input|End of file/.test(msg);
-                if (closed(m)) {
-                    for (let attempt = 1; ; attempt++) {
-                        await new Promise(res => setTimeout(res, THUMBNAIL_RETRY_MS * attempt));
-                        try {
-                            jpeg = await run(true);
-                            break;
-                        }
-                        catch (e2) {
-                            if (attempt >= THUMBNAIL_REOPENS || !closed((e2 as Error).message)) throw e2;
-                        }
-                    }
-                    this.thumbStats.fast++;
-                    this.thumbStats.reopened++;
-                    return this.keepThumbnail(key, jpeg);
-                }
-                jpeg = await run(false);
-                this.thumbStats.lastMiss = `${channel === undefined ? '' : `channel ${channel}: `}${scrubUrls(m, this.secrets()).slice(0, 200)}`;
-                if (this.thumbStats.fallback++ < 5) this.deps.log?.(`recordings: a thumbnail needed ffmpeg's default probing (${this.thumbStats.lastMiss})`);
-            }
-            return this.keepThumbnail(key, jpeg);
+            const jpeg = await this.withSlot(() => (this.deps.runFfmpeg ?? runFfmpeg)(ffmpeg, thumbnailArgs(job.args!, undefined, job.fast), THUMBNAIL_TIMEOUT_MS));
+            if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error('thumbnail failed: ffmpeg produced no JPEG');
+            this.thumbCloses = 0;
+            this.thumbs.set(job.key, jpeg);
+            while (this.thumbs.size > THUMBNAIL_CACHE) this.thumbs.delete(this.thumbs.keys().next().value!);
+            return jpeg;
         }
         catch (e) {
-            const msg = (e as Error).message;
-            const error = new Error(scrubUrls(msg, this.secrets()));
-            this.thumbStats.lastError = error.message.slice(0, 200);
-            // busy is momentary; anything else is remembered, and an ffmpeg failure may mean the route moved
-            if (!/playback busy/.test(msg)) this.thumbFails.set(key, { at: this.now(), error });
-            if (/^thumbnail failed/.test(msg)) this.routeFailed();
-            while (this.thumbFails.size > THUMBNAIL_CACHE) this.thumbFails.delete(this.thumbFails.keys().next().value!);
-            throw error;
+            const m = (e as Error).message;
+            // the NVR itself failed (an HTTP error, no stream, a busy NVR), or the fallback failed too
+            if (!/^thumbnail failed/.test(m) || /Server returned|did not finish|playback busy/.test(m) || !job.fast) throw e;
+            if (/Error opening input|End of file/.test(m)) {
+                // the NVR closed the stream at once (seen right after a route probe): asked again as it was, unless it
+                // keeps doing so, then thumbnails pause a minute
+                if (++this.thumbCloses >= THUMBNAIL_BREAKER) {
+                    this.thumbCloses = 0;
+                    this.thumbPausedUntil = this.now() + THUMBNAIL_PAUSE_MS;
+                    this.deps.log?.(`recordings: the NVR closed ${THUMBNAIL_BREAKER} thumbnail streams in a row; thumbnails paused for ${THUMBNAIL_PAUSE_MS / 1000} s`);
+                    throw e;
+                }
+                if (++job.reopens > THUMBNAIL_REOPENS) throw e;
+                this.requeueThumbnail(job, (this.deps.thumbnailRetryMs ?? THUMBNAIL_RETRY_MS) * job.reopens);
+                return undefined;
+            }
+            // the fast probe may miss the first frame (a stream starting between keyframes, H.265): ffmpeg's default
+            // probing once more
+            if (this.fallbackLogs++ < 5)
+                this.deps.log?.(`recordings: a thumbnail needed ffmpeg's default probing (${job.channel === undefined ? '' : `channel ${job.channel}: `}${scrubUrls(m, this.secrets()).slice(0, 200)})`);
+            job.fast = false;
+            this.requeueThumbnail(job, 0);
+            return undefined;
         }
+    }
+
+    /** A thumbnail's failure, scrubbed; remembered unless it is momentary, and an ffmpeg failure may mean the route moved. */
+    private thumbFailed(key: string, e: Error): Error {
+        const error = new Error(scrubUrls(e.message, this.secrets()));
+        if (!/playback busy|thumbnails paused/.test(e.message)) this.thumbFails.set(key, { at: this.now(), error });
+        if (/^thumbnail failed/.test(e.message)) this.routeFailed();
+        while (this.thumbFails.size > THUMBNAIL_CACHE) this.thumbFails.delete(this.thumbFails.keys().next().value!);
+        return error;
     }
 }
 
