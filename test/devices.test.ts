@@ -22,6 +22,7 @@ test('camera device manifest', () => {
     assert.equal(d.info?.serialNumber, '95270000TESTUID');
     assert.equal(cache.exactType, 'NVR');
     assert.equal(buildCameraDevice('nvr-1', { channel: 1 }).info?.serialNumber, undefined);
+    assert.equal(channelCacheFrom(4, { serial: 'NVRSERIAL' }, { channel: 4, online: 1 }, {}, ability, []).serialNumber, 'NVRSERIAL-5', 'no UID: the NVR serial and channel');
 });
 
 test('no siren/floodlight: no DeviceProvider, default name', () => {

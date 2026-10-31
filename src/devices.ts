@@ -95,13 +95,14 @@ export function parseCrops(entries: unknown): CropSpec[] {
 
 export const cropNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-crop-${slug}`;
 
-export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[]): DeviceManifest[] {
+export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[], serialNumber?: string): DeviceManifest[] {
     return crops.map(c => ({
         nativeId: cropNativeId(cameraNativeIdValue, c.slug),
         providerNativeId: cameraNativeIdValue,
         name: c.name,
         type: 'Camera',
         interfaces: ['VideoCamera', 'Settings'],
+        info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-${c.slug}` },
     }));
 }
 
@@ -136,7 +137,7 @@ export const mirrorNativeId = (cameraNativeIdValue: string, slug: string) => `${
 
 export const MIRROR_PRESENCE = ['Vehicle', 'Animal'] as const;
 
-export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorSpec[]): { mirrors: DeviceManifest[]; children: DeviceManifest[] } {
+export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorSpec[], serialNumber?: string): { mirrors: DeviceManifest[]; children: DeviceManifest[] } {
     const out = { mirrors: [] as DeviceManifest[], children: [] as DeviceManifest[] };
     for (const m of mirrors) {
         const nativeId = mirrorNativeId(cameraNativeIdValue, m.slug);
@@ -146,6 +147,7 @@ export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorS
             name: m.name,
             type: 'Camera',
             interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector', 'Settings', 'DeviceProvider'],
+            info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-${m.slug}` },
         });
         // Named "<camera> Vehicle Presence" so the patched HomeKit plugin puts them inside the camera tile.
         for (const g of MIRROR_PRESENCE)
@@ -162,7 +164,8 @@ export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelS
         online: status ? status.online === 1 : undefined,
         model: details.chnTypeInfo?.typeInfo ?? status?.typeInfo ?? nvr.model,
         firmware: details.chnTypeInfo?.firmVer,
-        serialNumber: status?.uid || undefined,
+        // cameras without a UID (some models) get the NVR's serial and their channel: unique, and stable
+        serialNumber: status?.uid || (nvr.serial ? `${nvr.serial}-${channel + 1}` : undefined),
         exactType: nvr.exactType,
         aiClasses,
         // Keep the shape abilityChn[channel] so the stock ability rules work unchanged.

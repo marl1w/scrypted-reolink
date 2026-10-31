@@ -179,8 +179,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             const name = devices.find(d => d.nativeId === camId)!.name;
             const storage = sdk.deviceManager.getDeviceStorage(camId);
             const crops = parseCrops(JSON.parse(storage?.getItem('crops') || '[]'));
-            const mirrors = buildMirrorDevices(camId, parseMirrors(JSON.parse(storage?.getItem('mirrors') || '[]'), crops));
-            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops), ...mirrors.mirrors];
+            const mirrors = buildMirrorDevices(camId, parseMirrors(JSON.parse(storage?.getItem('mirrors') || '[]'), crops), cache.serialNumber);
+            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops, cache.serialNumber), ...mirrors.mirrors];
             if (children.length)
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
             for (const m of mirrors.mirrors)
