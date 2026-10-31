@@ -7,7 +7,8 @@ import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
 import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, nightModeNativeId, parseCrops, parseMirrors, parseViewCrop, rawClasses, rawClassNativeId, rawMotionNativeId } from './devices';
-import { isNight, RecordingStreamType } from './recordings';
+import { isNight, MediaLinkKind, RecordingStreamType } from './recordings';
+import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
 import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
@@ -430,21 +431,41 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         return sdk.mediaManager.createFFmpegMediaObject(ff);
     }
 
-    async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
-        const clips = await this.recorder().clips(this.channel, { startTime: options?.startTime, endTime: options?.endTime, count: options?.count });
-        return clips.map(c => ({ ...c, thumbnailId: c.id, videoId: c.id }));
+    /** An absolute, signed link to a clip or its thumbnail, served by the plugin on its local endpoint. */
+    private async mediaLink(kind: MediaLinkKind, clipId: string): Promise<string> {
+        const base = await sdk.endpointManager.getLocalEndpoint(undefined, { public: true });
+        return mediaLink(base, { kind, nvr: this.nvr.nativeId!, channel: this.channel, clipId, exp: linkExpiry(Date.now()) }, this.nvr.clipKey());
     }
 
+    async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
+        const clips = await this.recorder().clips(this.channel, { startTime: options?.startTime, endTime: options?.endTime, count: options?.count });
+        // Scrypted's UI plays resources.video and shows resources.thumbnail directly (it never asks for the media objects)
+        const base = await sdk.endpointManager.getPath(undefined, { public: true }).catch(() => undefined);
+        const key = this.nvr.clipKey(), exp = linkExpiry(Date.now());
+        const link = (kind: MediaLinkKind, clipId: string) => base ? { href: mediaLink(base, { kind, nvr: this.nvr.nativeId!, channel: this.channel, clipId, exp }, key) } : undefined;
+        return clips.map(c => ({
+            ...c, thumbnailId: c.id, videoId: c.id,
+            resources: base ? { thumbnail: link('thumb', c.id), video: link('clip', c.id) } : undefined,
+        }));
+    }
+
+    /**
+     * A clip as video/mp4 a browser plays: a link to the plugin's own endpoint, which remuxes the NVR's playback stream
+     * to fragmented MP4 while the clip plays (no converter from an FFmpegInput to a playable type exists). Converts to
+     * a local URL (what Scrypted's UI asks for) and a URL, both the plugin's local endpoint.
+     */
     async getVideoClip(videoId: string): Promise<MediaObject> {
-        const c = this.recorder().decodeClip(this.channel, videoId);
-        const input = await this.recorder().clipInput(this.channel, videoId);
-        return this.recordingMedia(input, c.stream, c.startTime, c.duration * 1000 || undefined);
+        this.recorder().decodeClip(this.channel, videoId);
+        const url = await this.mediaLink('clip', videoId);
+        return sdk.mediaManager.createMediaObject(Buffer.from(url), 'video/mp4', {
+            sourceId: this.id,
+            toMimeTypes: [ScryptedMimeTypes.LocalUrl, ScryptedMimeTypes.Url],
+            convert: async () => Buffer.from(url) as any,
+        });
     }
 
     async getVideoClipThumbnail(thumbnailId: string, _options?: VideoClipThumbnailOptions): Promise<MediaObject> {
-        const r = this.recorder();
-        const c = r.decodeClip(this.channel, thumbnailId);
-        const jpeg = await r.thumbnail(`${this.channel}|clip|${thumbnailId}`, () => r.input(this.channel, c, c.offset, undefined, { thumbnail: true }));
+        const jpeg = await this.recorder().clipThumbnail(this.channel, thumbnailId);
         return sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 

@@ -1,10 +1,11 @@
-import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from '@scrypted/sdk';
+import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, HttpRequest, HttpRequestHandler, HttpResponse, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from '@scrypted/sdk';
 import { randomBytes } from 'node:crypto';
 import packageJson from '../package.json';
+import { handleMediaRequest } from './media-http';
 import { reolinkMqtt } from './mqtt';
 import { ReolinkNvr } from './nvr';
 
-class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator {
+class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, HttpRequestHandler {
     private nvrs = new Map<string, ReolinkNvr>();
 
     constructor(nativeId?: string) {
@@ -48,6 +49,12 @@ class ReolinkBaichuanPlugin extends ScryptedDeviceBase implements DeviceProvider
             this.nvrs.set(nativeId, n);
         }
         return n;
+    }
+
+    /** Clips and clip thumbnails behind signed links (see media-http.ts). */
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        const handled = await handleMediaRequest(request, response, id => this.nvrs.get(id));
+        if (!handled) response.send('not found', { code: 404 });
     }
 
     async releaseDevice(_id: string, nativeId: string): Promise<void> {

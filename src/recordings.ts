@@ -520,9 +520,60 @@ export function recordingInputArgs(route: PlaybackRoute, url: string, seek: numb
 /** Thumbnail width: small, as the clip lists and the timeline show them. */
 export const THUMBNAIL_WIDTH = 320;
 
-/** One small JPEG of the first frame of an input. */
-export function thumbnailArgs(input: string[], width = THUMBNAIL_WIDTH): string[] {
-    return ['-hide_banner', '-loglevel', 'error', '-nostdin', ...input, '-frames:v', '1', '-vf', `scale=${width}:-2`, '-q:v', '6', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'];
+/**
+ * Probing limits put before an input, so ffmpeg starts from the first packets instead of analysing 5 s of a stream
+ * the NVR sends at 1x. 0 would mean ffmpeg's default, hence a small value.
+ */
+export const FAST_PROBE_ARGS = ['-analyzeduration', '300000', '-probesize', '500000'];
+
+/**
+ * One small JPEG of the first frame of an input. `fast` probes only the first packets (about a second instead of six
+ * on a 1x playback stream); without it, ffmpeg's default probing, the fallback.
+ */
+export function thumbnailArgs(input: string[], width = THUMBNAIL_WIDTH, fast = true): string[] {
+    return ['-hide_banner', '-loglevel', 'error', '-nostdin', ...(fast ? FAST_PROBE_ARGS : []), ...input, '-frames:v', '1', '-vf', `scale=${width}:-2`, '-q:v', '6', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'];
+}
+
+/**
+ * A recording remuxed (no re-encode) to fragmented MP4 on stdout, which a browser plays while it arrives: the first
+ * video track and the first audio track if any.
+ */
+export function clipMp4Args(input: string[]): string[] {
+    return ['-hide_banner', '-loglevel', 'error', '-nostdin', '-analyzeduration', '1000000', '-probesize', '1000000', ...input,
+        '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
+}
+
+/** What a signed media link serves. */
+export type MediaLinkKind = 'clip' | 'thumb';
+
+export interface MediaLink {
+    kind: MediaLinkKind;
+    /** the NVR device's native id */
+    nvr: string;
+    channel: number;
+    clipId: string;
+    /** expiry, epoch seconds */
+    exp: number;
+}
+
+const linkPayload = (l: MediaLink) => ['m1', l.kind, l.nvr, l.channel, l.exp, l.clipId].join('|');
+
+/** The query of a media link, signed with the install's key: the endpoint is public, so the link is the permission. */
+export function mediaLinkQuery(l: MediaLink, key: Buffer): string {
+    return new URLSearchParams({ n: l.nvr, c: String(l.channel), id: l.clipId, e: String(l.exp), s: clipSignature(linkPayload(l), key) }).toString();
+}
+
+/** The unverified fields of a media link query (the NVR they name holds the key), or undefined when malformed. */
+export function parseMediaLink(kind: MediaLinkKind, q: URLSearchParams): (MediaLink & { sig: string }) | undefined {
+    const nvr = q.get('n') ?? '', c = q.get('c') ?? '', e = q.get('e') ?? '', clipId = q.get('id') ?? '', sig = q.get('s') ?? '';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(nvr) || !/^\d{1,3}$/.test(c) || !/^\d{1,12}$/.test(e) || !clipId || clipId.length > 512 || !sig) return undefined;
+    return { kind, nvr, channel: +c, exp: +e, clipId, sig };
+}
+
+/** True when a parsed link carries a valid signature and has not expired. */
+export function verifyMediaLink(l: MediaLink & { sig: string }, key: Buffer, nowMs: number): boolean {
+    const want = Buffer.from(clipSignature(linkPayload(l), key)), sig = Buffer.from(l.sig);
+    return sig.length === want.length && timingSafeEqual(sig, want) && l.exp * 1000 > nowMs;
 }
 
 /**

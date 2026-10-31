@@ -23,7 +23,7 @@ Polling the HTTP API opens one session per channel and asks for the motion and A
 
 Each camera also implements Scrypted's VideoClips and VideoRecorder from the NVR's own recordings, so any plugin can list, play and download them. A guest account is enough.
 
-- **Clips:** substream recordings in 5 minute windows. Each clip has its trigger types (person, vehicle, animal, motion…) from the NVR's alarm-video search, and a small JPEG thumbnail. On 24/7 recorders, windows with no trigger are left out.
+- **Clips:** substream recordings in 5 minute windows. Each clip has its trigger types (person, vehicle, animal, motion…) from the NVR's alarm-video search, and a small JPEG thumbnail. Clips play in Scrypted's own UI as MP4, remuxed by the plugin without re-encoding. On 24/7 recorders, windows with no trigger are left out.
 - **Recording streams:** play from any time, from the main stream or the substream. With a duration the stream is bounded, so it can be downloaded.
 - **Time zones:** recording times are converted with the NVR's own time zone and DST rules. The playback endpoint the NVR answers on is measured once per run. Searches are cached and run one at a time.
 
