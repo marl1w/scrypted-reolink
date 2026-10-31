@@ -152,6 +152,25 @@ export class HttpSession {
         return arr;
     }
 
+    /**
+     * One read command as a GET with its parameters in the query (`?cmd=X&channel=N`). Some NVR firmware answers a
+     * command only this way: GetAiState in a POST body returns a false -99 "device offline" on those.
+     */
+    async get(cmd: string, query: Record<string, string | number>, retry = true): Promise<any> {
+        const token = await this.getToken();
+        const q = Object.entries(query).map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('');
+        const r = await this.raw('GET', `/api.cgi?cmd=${encodeURIComponent(cmd)}${q}&token=${encodeURIComponent(token)}`);
+        const j = parseJson(r.body);
+        const res: ApiResult | undefined = Array.isArray(j) ? j[0] : j;
+        if (res?.error?.rspCode === RSP_LOGIN_FIRST && retry) {
+            this.invalidate();
+            return this.get(cmd, query, false);
+        }
+        if (!res || res.error || res.code !== 0)
+            throw new ApiError(`${cmd} failed${res?.error ? ` (rspCode ${res.error.rspCode})` : ''}`, res?.error?.rspCode);
+        return res.value;
+    }
+
     /** Single command; throws ApiError on an error result. */
     async one(cmd: ApiCommand): Promise<any> {
         const [r] = await this.call([cmd]);

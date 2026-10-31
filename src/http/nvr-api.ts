@@ -76,10 +76,14 @@ export class NvrApi {
             { cmd: 'GetEnc', action: 1, param: { channel } },
             { cmd: 'GetAiState', param: { channel } },
         ]);
+        let ai: AiSupport | undefined = find(rs, 'GetAiState')?.value;
+        // some firmware answers GetAiState only as a GET (the POST body gets a false -99 "device offline")
+        if (!supportedAiClasses(ai).length)
+            ai = await this.session.get('GetAiState', { channel }).catch(() => ai);
         return {
             chnTypeInfo: find(rs, 'GetChnTypeInfo')?.value,
             enc: find(rs, 'GetEnc')?.value?.Enc,
-            ai: find(rs, 'GetAiState')?.value,
+            ai,
         };
     }
 

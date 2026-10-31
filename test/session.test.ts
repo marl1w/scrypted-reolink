@@ -70,3 +70,10 @@ test('discovery helpers: channels with uid, AI support, siren/floodlight abiliti
     await api.setSiren(0, true);
     await api.setWhiteLed(2, false);
 }));
+
+test('AI support comes from a GET GetAiState when the POST form fails with -99', () => withHttp(async (m, _s, api) => {
+    m.aiOnlyGet = true;
+    const d = await api.channelDetails(2);
+    assert.deepEqual(supportedAiClasses(d.ai), ['people', 'dog_cat']);
+    assert.ok(m.calls.includes('GetAiState(GET)'));
+}));

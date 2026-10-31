@@ -26,6 +26,9 @@ export class MockHttpNvr {
 
     stop() { return new Promise<void>(r => this.server!.close(() => r())); }
 
+    /** GetAiState in a POST body fails with -99 and works only as a GET (as some NVR firmware does). */
+    aiOnlyGet = false;
+
     /** Simulates the device dropping all sessions (e.g. lease expiry on the NVR). */
     expireAll() { this.tokens.clear(); }
 
@@ -52,6 +55,12 @@ export class MockHttpNvr {
         }
         if (!this.tokens.has(tok))
             return json([{ cmd, code: 1, error: { rspCode: -6, detail: 'please login first' } }]);
+        // firmware that answers GetAiState only as a GET: the POST body form gets -99
+        if (cmd === 'GetAiState' && req.method === 'GET') {
+            this.calls.push('GetAiState(GET)');
+            const ch = Number(u.searchParams.get('channel'));
+            return json([{ cmd, code: 0, value: { channel: ch, people: { support: 1, alarm_state: 0 }, vehicle: { support: 0, alarm_state: 0 }, dog_cat: { support: 1, alarm_state: 0 } } }]);
+        }
         if (cmd === 'Snap') {
             this.calls.push('Snap');
             return ['image/jpeg', Buffer.from([0xff, 0xd8, 0x00, 0xff, 0xd9])];
@@ -65,7 +74,7 @@ export class MockHttpNvr {
                 case 'GetAbility': return { cmd: c.cmd, code: 0, value: { Ability: { abilityChn: [{ live: { ver: 1 }, supportAudioAlarm: { ver: 1 } }, {}, { live: { ver: 1 }, floodLight: { ver: 1 } }] } } };
                 case 'GetChnTypeInfo': return { cmd: c.cmd, code: 0, value: { typeInfo: ch === 2 ? 'CAM-TEST' : 'RLC-810A', firmVer: 'v1' } };
                 case 'GetEnc': return { cmd: c.cmd, code: 0, value: { Enc: { channel: ch, mainStream: { width: 3840, height: 2160, vType: 'h264' } } } };
-                case 'GetAiState': return { cmd: c.cmd, code: 0, value: { channel: ch, people: { support: 1, alarm_state: 0 }, vehicle: { support: 1, alarm_state: 0 }, dog_cat: { support: 0, alarm_state: 0 } } };
+                case 'GetAiState': return this.aiOnlyGet ? { cmd: c.cmd, code: 1, error: { rspCode: -99, detail: 'device offline' } } : { cmd: c.cmd, code: 0, value: { channel: ch, people: { support: 1, alarm_state: 0 }, vehicle: { support: 1, alarm_state: 0 }, dog_cat: { support: 0, alarm_state: 0 } } };
                 case 'AudioAlarmPlay': case 'SetWhiteLed': return { cmd: c.cmd, code: 0, value: { rspCode: 200 } };
                 default: return { cmd: c.cmd, code: 1, error: { rspCode: -9, detail: 'not supported' } };
             }
