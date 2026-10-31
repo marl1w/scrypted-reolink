@@ -174,9 +174,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     /** The floodlight's state as the NVR pushes it (it also switches by itself, on motion or schedule). */
     floodlightState(on: boolean) {
-        this.getDevice(`${this.nativeId}-floodlight`).then((f?: ReolinkFloodlight) => {
-            if (f && f.on !== on) f.on = on;
-        }).catch(() => { /* no floodlight on this channel */ });
+        this.getDevice(`${this.nativeId}-floodlight`).then((f?: ReolinkFloodlight) => f?.reported(on))
+            .catch(() => { /* no floodlight on this channel */ });
     }
 
     /** The siren's state as the NVR pushes it (cmd 547), also when the camera sounds it by itself. */
@@ -607,6 +606,18 @@ export class ReolinkFloodlight extends ScryptedDeviceBase implements OnOff {
         this.keepOn = undefined;
         await this.send(false);
         this.on = false;
+    }
+
+    /**
+     * The state the NVR pushes (cmd 291). Off while we keep it on means something else switched it off (the NVR,
+     * the app, a rule): stop keeping it on, or the next refresh would light it again behind everyone's back.
+     */
+    reported(on: boolean) {
+        if (!on) {
+            clearInterval(this.keepOn);
+            this.keepOn = undefined;
+        }
+        if (this.on !== on) this.on = on;
     }
 }
 

@@ -124,3 +124,26 @@ test('a start keeps the siren, floodlight and class children while the abilities
         await m.stop();
     }
 });
+
+test('a floodlight the NVR reports off is no longer kept on (no re-light behind everyone\'s back)', async (t) => {
+    const { ReolinkFloodlight } = require('../src/camera');
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const sent: boolean[] = [];
+    const camera = { channel: 1, nvr: { pushClient: () => ({ channelCommand: async (_c: number, _ch: number, xml: string) => { sent.push(/<status>1<\/status>|"on"|>1</.test(xml) && !/<status>0<\/status>/.test(xml)); } }) } };
+    const f = new ReolinkFloodlight('nvr-1-ch1-floodlight', camera);
+    await f.turnOn();
+    assert.equal(f.on, true);
+    t.mock.timers.tick(150_000);
+    await Promise.resolve();
+    assert.equal(sent.length, 2, 'kept on while wanted');
+    f.reported(false); // switched off elsewhere (NVR, app, expiry)
+    assert.equal(f.on, false);
+    t.mock.timers.tick(600_000);
+    await Promise.resolve();
+    assert.equal(sent.length, 2, 'no re-send after an external off');
+    f.reported(true);
+    assert.equal(f.on, true, 'an external on is mirrored, without starting a keep-on');
+    t.mock.timers.tick(600_000);
+    await Promise.resolve();
+    assert.equal(sent.length, 2);
+});
