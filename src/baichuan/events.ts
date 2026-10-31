@@ -1,5 +1,5 @@
 import { XML_DECL } from './constants';
-import { childText, findAll, findFirst, parseXml, XmlNode } from './xml';
+import { child, childText, findAll, findFirst, parseXml, XmlNode } from './xml';
 
 /** AI classes reported in AItype. Unknown classes are passed through as strings. */
 export type AiType = 'people' | 'vehicle' | 'dog_cat' | 'face' | 'package' | 'other' | (string & {});
@@ -20,6 +20,35 @@ export interface PushEvent {
     status: string[];
     recording?: boolean;
     timestamp?: number;
+    /** Smart events active in this push (line_crossing, intrusion, loitering, forgotten_item, taken_item). */
+    smart?: string[];
+}
+
+/** cmd 33 smartAiType names (reolink_aio's SMART_AI keys) as detection classes. */
+export const SMART_EVENT_CLASSES: Record<string, string> = {
+    crossline: 'line_crossing',
+    intrusion: 'intrusion',
+    loitering: 'loitering',
+    legacy: 'forgotten_item',
+    loss: 'taken_item',
+};
+
+/**
+ * Smart events of one AlarmEvent. A type is active when its `index` bitmap names a zone or line (bit n = location
+ * n), or when it lists sub entries; a type with index 0 and no sub entries is listed but idle. Unknown types are ignored.
+ */
+export function parseSmartEvents(ev: XmlNode): string[] {
+    const list = child(ev, 'smartAiTypeList');
+    if (!list) return [];
+    const out = new Set<string>();
+    for (const s of findAll(list, 'smartAiType')) {
+        const cls = SMART_EVENT_CLASSES[childText(s, 'type') ?? ''];
+        if (!cls) continue;
+        const index = childText(s, 'index');
+        const active = (index !== undefined && /^\d+$/.test(index) && parseInt(index, 10) > 0) || s.children.some(c => c.name === 'subList');
+        if (active) out.add(cls);
+    }
+    return [...out];
 }
 
 function tokens(s: string | undefined): string[] {
@@ -63,6 +92,7 @@ export function parseAlarmEvents(xml: string | XmlNode): PushEvent[] {
                     status,
                     recording: rec === undefined ? undefined : rec === '1',
                     timestamp: ts && /^\d+$/.test(ts) ? parseInt(ts, 10) : undefined,
+                    smart: parseSmartEvents(ev),
                 });
             }
             else if (ev.name === 'DayNightEvent') {
@@ -81,7 +111,7 @@ export function formatEvent(e: PushEvent): string {
         return `ch${e.channel} daynight=${e.dayNight}`;
     const ai = [...e.ai].join(',') || 'none';
     const extra = e.status.filter(s => s !== 'MD');
-    return `ch${e.channel} motion=${e.motion ? 1 : 0} ai=${ai}${extra.length ? ` status=${extra.join(',')}` : ''}`;
+    return `ch${e.channel} motion=${e.motion ? 1 : 0} ai=${ai}${extra.length ? ` status=${extra.join(',')}` : ''}${e.smart?.length ? ` smart=${e.smart.join(',')}` : ''}`;
 }
 
 /** Floodlight state pushes (cmd 291): one entry per channel listed, as reolink_aio reads them. */

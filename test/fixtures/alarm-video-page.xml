@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<alarmVideoInfo version="1.1">
+<channelId>0</channelId>
+<bFinished>1</bFinished>
+<alarmVideoList>
+<alarmVideo>
+<fileName>0120261030121128</fileName>
+<bHasRecFile>1</bHasRecFile>
+<bEncrypted>0</bEncrypted>
+<alarmType>people</alarmType>
+<fileId>1-0-0-01260930111128-00000</fileId>
+<startTime><year>2026</year><month>10</month><day>30</day><hour>12</hour><minute>11</minute><second>28</second></startTime>
+<endTime><year>2026</year><month>10</month><day>30</day><hour>12</hour><minute>12</minute><second>11</second></endTime>
+</alarmVideo>
+<alarmVideo>
+<fileName>0120261030121128</fileName>
+<bHasRecFile>1</bHasRecFile>
+<bEncrypted>0</bEncrypted>
+<alarmType>md</alarmType>
+<fileId>1-0-0-01260930111128-00000</fileId>
+<startTime><year>2026</year><month>10</month><day>30</day><hour>12</hour><minute>11</minute><second>45</second></startTime>
+<endTime><year>2026</year><month>10</month><day>30</day><hour>12</hour><minute>12</minute><second>3</second></endTime>
+</alarmVideo>
+<alarmVideo>
+<fileName>0120261030132833</fileName>
+<bHasRecFile>1</bHasRecFile>
+<bEncrypted>0</bEncrypted>
+<alarmType>vehicle, crossline</alarmType>
+<fileId>1-0-0-01260930122833-00000</fileId>
+<startTime><year>2026</year><month>10</month><day>30</day><hour>13</hour><minute>28</minute><second>34</second></startTime>
+<endTime><year>2026</year><month>10</month><day>30</day><hour>13</hour><minute>29</minute><second>0</second></endTime>
+</alarmVideo>
+</alarmVideoList>
+</alarmVideoInfo>
+</body>

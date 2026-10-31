@@ -36,13 +36,16 @@ test('token rejected by the device (-6): one re-login, request retried', () => w
     assert.equal(m.tokens.size, 1);
 }));
 
-test('lease near its end: logout of the old token, then a new login', () => withHttp(async (m, _s, api) => {
+test('lease near its end: a new login; the old token is left to expire, and logged out on stop', () => withHttp(async (m, s, api) => {
     m.leaseTime = 1; // renew margin 60 s > lease: every call renews
     await api.devInfo();
     await api.devInfo();
     assert.equal(m.logins, 2);
-    assert.equal(m.logouts, 1);
-    assert.equal(m.tokens.size, 1);
+    assert.equal(m.logouts, 0, 'not logged out early: a URL handed out may still carry it');
+    assert.equal(s.sessionsInUse, 2);
+    await s.stop();
+    assert.equal(m.tokens.size, 0, 'every login paired with a logout');
+    assert.equal(m.logouts, 2);
 }));
 
 test('failed login backs off instead of hammering', () => withHttp(async (m, _s, api) => {
@@ -77,3 +80,22 @@ test('AI support comes from a GET GetAiState when the POST form fails with -99',
     assert.deepEqual(supportedAiClasses(d.ai), ['people', 'dog_cat']);
     assert.ok(m.calls.includes('GetAiState(GET)'));
 }));
+
+test('a token close to its end is renewed early when a caller needs it to last; capped by the lease', () => {
+    let now = 1_000_000;
+    return withHttp(async (m, s) => {
+        m.leaseTime = 3600;
+        const a = await s.getToken();
+        assert.equal(await s.getToken(10 * 60_000), a, 'an hour left');
+        now += 45 * 60_000;
+        assert.equal(await s.getToken(), a, 'still valid for a plain call');
+        const b = await s.getToken(20 * 60_000);
+        assert.notEqual(b, a, 'renewed: 15 minutes left, 20 asked');
+        assert.equal(await s.getToken(24 * 3_600_000), b, 'asking more than a lease does not renew a fresh token');
+        assert.equal(m.logins, 2);
+        assert.equal(m.logouts, 0, 'the old token is left to expire: URLs carrying it keep working');
+        assert.equal(m.tokens.size, 2);
+        await s.stop();
+        assert.equal(m.tokens.size, 0, 'both logged out on stop');
+    }, { now: () => now });
+});

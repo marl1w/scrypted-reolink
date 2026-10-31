@@ -50,9 +50,11 @@ export function cameraInterfaces(cache: ChannelCache): string[] {
         'ObjectDetector',
         'Settings',
         'Online',
+        'VideoClips',
+        'VideoRecorder',
+        // Night mode and Camera motion children on every camera; siren and floodlight where supported
+        'DeviceProvider',
     ];
-    if (hasSiren(cache.ability, cache.channel) || hasFloodlight(cache.ability, cache.channel))
-        ifs.push('DeviceProvider');
     return ifs;
 }
 
@@ -69,13 +71,42 @@ export function buildCameraDevice(nvrNativeId: string, cache: ChannelCache, nvrN
     };
 }
 
-/** Siren and floodlight children, with the stock suffixes and types. */
-export function buildChildDevices(cameraNativeIdValue: string, cameraName: string, cache: ChannelCache): DeviceManifest[] {
-    const out: DeviceManifest[] = [];
-    if (hasSiren(cache.ability, cache.channel))
-        out.push({ nativeId: `${cameraNativeIdValue}-siren`, providerNativeId: cameraNativeIdValue, name: `${cameraName} Siren`, type: 'Siren', interfaces: ['OnOff'] });
-    if (hasFloodlight(cache.ability, cache.channel))
-        out.push({ nativeId: `${cameraNativeIdValue}-floodlight`, providerNativeId: cameraNativeIdValue, name: `${cameraName} Floodlight`, type: 'Light', interfaces: ['OnOff'] });
+export const nightModeNativeId = (cameraNativeIdValue: string) => `${cameraNativeIdValue}-nightmode`;
+export const rawMotionNativeId = (cameraNativeIdValue: string) => `${cameraNativeIdValue}-rawmotion`;
+
+const RAW_CLASS_LABEL: Record<string, string> = { people: 'person', vehicle: 'vehicle', dog_cat: 'animal', face: 'face', package: 'package' };
+
+/** AI classes with a raw child / add-on entity: the device's own names, kept to safe identifiers. */
+export const rawClasses = (aiClasses: string[] | undefined) => (aiClasses ?? []).filter(c => /^[a-z0-9][a-z0-9_]{0,63}$/.test(c));
+
+/** A device AI class as people name it (people -> person, dog_cat -> animal), as the MQTT add-on names its entities. */
+export const rawClassLabel = (cls: string) => RAW_CLASS_LABEL[cls] ?? cls.replace(/_/g, ' ');
+
+export const rawClassNativeId = (cameraNativeIdValue: string, cls: string) => `${cameraNativeIdValue}-raw-${rawClassLabel(cls).replace(/ /g, '_')}`;
+
+/**
+ * Night mode (on while the camera is in IR / black and white, from the NVR's day/night push), Camera motion and
+ * Camera <class> per supported AI class (the camera's raw levels from each push: no hold, no trigger rule, no day/night
+ * ignore), then siren and floodlight with the stock suffixes and types.
+ */
+export function buildChildDevices(cameraNativeIdValue: string, cameraName: string, cache: ChannelCache, existing: string[] = []): DeviceManifest[] {
+    const id = cameraNativeIdValue;
+    const rawPrefix = `${id}-raw-`;
+    // a field not read yet (no ability, no AI classes) keeps the children announced before, rather than removing them
+    const raw = cache.aiClasses
+        ? rawClasses(cache.aiClasses).map(c => ({ nativeId: rawClassNativeId(id, c), label: rawClassLabel(c) }))
+        : existing.filter(n => n.startsWith(rawPrefix) && /^[a-z0-9_]+$/.test(n.slice(rawPrefix.length))).map(n => ({ nativeId: n, label: n.slice(rawPrefix.length).replace(/_/g, ' ') }));
+    const out: DeviceManifest[] = [
+        { nativeId: nightModeNativeId(id), providerNativeId: id, name: `${cameraName} Night mode`, type: 'Sensor', interfaces: ['BinarySensor'] },
+        { nativeId: rawMotionNativeId(id), providerNativeId: id, name: `${cameraName} Camera motion`, type: 'Sensor', interfaces: ['MotionSensor'] },
+        // one per AI class the channel supports: the camera's raw level, named as the add-on's "Camera person" entities
+        ...raw.map(r => ({ nativeId: r.nativeId, providerNativeId: id, name: `${cameraName} Camera ${r.label}`, type: 'Sensor', interfaces: ['OccupancySensor'] })),
+    ];
+    const known = !!cache.ability;
+    if (known ? hasSiren(cache.ability, cache.channel) : existing.includes(`${id}-siren`))
+        out.push({ nativeId: `${id}-siren`, providerNativeId: id, name: `${cameraName} Siren`, type: 'Siren', interfaces: ['OnOff'] });
+    if (known ? hasFloodlight(cache.ability, cache.channel) : existing.includes(`${id}-floodlight`))
+        out.push({ nativeId: `${id}-floodlight`, providerNativeId: id, name: `${cameraName} Floodlight`, type: 'Light', interfaces: ['OnOff'] });
     return out;
 }
 

@@ -1,4 +1,4 @@
-import sdk, { Camera, DeviceProvider, EventListenerRegister, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import sdk, { BinarySensor, Camera, DeviceProvider, EventListenerRegister, FFmpegInput, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, PictureOptions, RecordingStreamThumbnailOptions, RequestMediaStreamOptions, RequestPictureOptions, RequestRecordingStreamOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera, VideoClip, VideoClipOptions, VideoClips, VideoClipThumbnailOptions, VideoRecorder } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { Cmd } from './baichuan/constants';
 import { floodlightXml, sirenXml } from './baichuan/events';
@@ -6,11 +6,15 @@ import { rawEntities, reolinkMqtt } from './mqtt';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
-import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, parseCrops, parseMirrors, parseViewCrop } from './devices';
+import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, nightModeNativeId, parseCrops, parseMirrors, parseViewCrop, rawClasses, rawClassNativeId, rawMotionNativeId } from './devices';
+import { isNight, RecordingStreamType } from './recordings';
+import type { NvrRecordings, RecordingInput } from './recorder';
 import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 
 const SNAPSHOT_REUSE_MS = 300;
+/** Recording thumbnails are taken at this granularity. */
+const THUMBNAIL_BUCKET_MS = 10_000;
 const SNAPSHOT_WAIT_MS = 1500;
 /** The keyframe cache retries Rebroadcast after reading the NVR for this long, doubling up to the max. */
 const REBROADCAST_RETRY_MS = 60_000;
@@ -20,7 +24,7 @@ const CACHE_START_SPREAD_MS = 5000;
 /** A repeated warning (substream not prebuffered, cache reading the NVR) is logged at most this often. */
 const WARN_EVERY_MS = 600_000;
 
-export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, ObjectDetector, Settings, Online, DeviceProvider {
+export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, ObjectDetector, Settings, Online, DeviceProvider, VideoClips, VideoRecorder {
     storageSettings = new StorageSettings(this, {
         motionTimeout: {
             title: 'Motion Timeout',
@@ -96,7 +100,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
                 };
                 sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, od);
             },
-            dayNight: mode => { this.storageSettings.values.dayNight = mode; },
+            dayNight: mode => this.nightModeState(mode),
             raw: (motion, classes) => this.publishRaw(motion, classes),
         });
         this.snapshots = new KeyframeCache({
@@ -110,6 +114,44 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         });
         if (this.storageSettings.values.snapshotCache) this.snapshots.start(Math.random() * CACHE_START_SPREAD_MS);
         this.watchSettings();
+        // states read from the NVR before this device was created
+        const st = nvr.channelStates.get(channel);
+        if (st?.dayNight !== undefined) this.nightModeState(st.dayNight);
+        if (st?.recording !== undefined) this.recordingState(st.recording);
+    }
+
+    /** A child's device once it has been announced to Scrypted; undefined before, so no state is written to it. */
+    private async announcedChild<T>(nativeId: string): Promise<T | undefined> {
+        return this.nvr.isAnnounced(nativeId) ? this.getDevice(nativeId) : undefined;
+    }
+
+    /** Day/night as the NVR reports it (push, or the read at subscription): the setting and the Night mode child. */
+    nightModeState(mode: string) {
+        if (this.storageSettings.values.dayNight !== mode) this.storageSettings.values.dayNight = mode;
+        this.dayNightKnown = mode;
+        const night = isNight(mode);
+        this.announcedChild<ReolinkNightMode>(nightModeNativeId(this.nativeId!)).then(n => {
+            if (n && n.binaryState !== night) n.binaryState = night;
+        }).catch(() => { /* not announced yet */ });
+    }
+
+    /** Day/night reported in this run, for children announced later. */
+    private dayNightKnown?: string;
+
+    /** Children were just announced: they get the states known so far. */
+    applyChildStates() {
+        if (this.dayNightKnown !== undefined) this.nightModeState(this.dayNightKnown);
+        if (this.rawKnown) this.publishRaw(this.rawLast.motion, this.rawLast.classes);
+    }
+
+    /** Whether the NVR records this channel (cmd 81 `enable`). */
+    recordingState(on: boolean) {
+        if (this.recordingActive !== on) this.recordingActive = on;
+    }
+
+    /** Smart events (line crossing, intrusion...) this channel supports; the others are never reported. */
+    smartEvents(): string[] {
+        return this.nvr.smartEvents(this.channel);
     }
 
     private warnedAt = new Map<string, number>();
@@ -154,10 +196,22 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         if (this.rawKnown) this.publishRaw(this.rawLast.motion, this.rawLast.classes);
     }
 
-    /** The camera's own motion and AI classes, exact, as entities of this camera in the Scrypted MQTT bridge. */
+    /**
+     * The camera's own motion and AI classes, exact: the Camera motion child, and entities of this camera in the
+     * Scrypted MQTT bridge. Undefined motion: the connection is lost, the level is unknown.
+     */
     private publishRaw(motion: boolean | undefined, classes: string[]) {
         this.rawKnown = motion !== undefined;
         this.rawLast = { motion, classes };
+        this.announcedChild<ReolinkRawMotion>(rawMotionNativeId(this.nativeId!)).then(m => {
+            if (m && m.motionDetected !== motion) m.motionDetected = motion;
+        }).catch(() => { /* not announced yet */ });
+        for (const c of rawClasses(this.nvr.channelCache(this.channel)?.aiClasses)) {
+            const on = motion === undefined ? undefined : classes.includes(c);
+            this.announcedChild<ReolinkRawClass>(rawClassNativeId(this.nativeId!, c)).then(o => {
+                if (o && o.occupied !== on) o.occupied = on;
+            }).catch(() => { /* not announced yet */ });
+        }
         if (!this.id) return;
         const declared = this.nvr.channelCache(this.channel)?.aiClasses ?? [];
         const key = `${this.name}|${declared.join(',')}`;
@@ -296,6 +350,10 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     onPush(ev: PushEvent) {
+        if (ev.smart?.length) {
+            const supported = this.smartEvents();
+            ev = { ...ev, smart: ev.smart.filter(c => supported.includes(c)) };
+        }
         this.motion.handle(ev);
     }
 
@@ -342,11 +400,105 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
-        return { classes: this.nvr.channelCache(this.channel)?.aiClasses ?? [] };
+        return { classes: [...this.nvr.channelCache(this.channel)?.aiClasses ?? [], ...this.smartEvents()] };
     }
 
     async getDetectionInput(): Promise<MediaObject> {
         throw new Error('detection input not available');
+    }
+
+    private recorder(): NvrRecordings {
+        const r = this.nvr.recordings;
+        if (!r) throw new Error('NVR not configured');
+        return r;
+    }
+
+    /** An FFmpegInput of a recording; `startTime` travels in its metadata for getRecordingStreamCurrentTime. */
+    private recordingMedia(input: RecordingInput, stream: RecordingStreamType, startTime: number, duration?: number): Promise<MediaObject> {
+        const ff: FFmpegInput = {
+            url: input.url,
+            inputArguments: input.inputArguments,
+            container: input.container,
+            mediaStreamOptions: {
+                id: stream,
+                name: stream === 'main' ? 'Main Stream (recording)' : 'Substream (recording)',
+                container: input.container,
+                video: {},
+                audio: {},
+                metadata: { recordingStartTime: startTime, recordingDuration: duration },
+            } as ResponseMediaStreamOptions,
+        };
+        return sdk.mediaManager.createFFmpegMediaObject(ff);
+    }
+
+    async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
+        const clips = await this.recorder().clips(this.channel, { startTime: options?.startTime, endTime: options?.endTime, count: options?.count });
+        return clips.map(c => ({ ...c, thumbnailId: c.id, videoId: c.id }));
+    }
+
+    async getVideoClip(videoId: string): Promise<MediaObject> {
+        const c = this.recorder().decodeClip(this.channel, videoId);
+        const input = await this.recorder().clipInput(this.channel, videoId);
+        return this.recordingMedia(input, c.stream, c.startTime, c.duration * 1000 || undefined);
+    }
+
+    async getVideoClipThumbnail(thumbnailId: string, _options?: VideoClipThumbnailOptions): Promise<MediaObject> {
+        const r = this.recorder();
+        const c = r.decodeClip(this.channel, thumbnailId);
+        const jpeg = await r.thumbnail(`${this.channel}|clip|${thumbnailId}`, () => r.input(this.channel, c, c.offset, undefined, { thumbnail: true }));
+        return sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
+    }
+
+    async removeVideoClips(..._videoClipIds: string[]): Promise<void> {
+        throw new Error('not supported: NVR recordings are never deleted from here');
+    }
+
+    /**
+     * main or sub: the asked stream id, else the destination (low resolution and remote ask for the substream),
+     * else the main stream.
+     */
+    private recordingStream(options?: RequestMediaStreamOptions): RecordingStreamType {
+        if (options?.id === 'main' || options?.id === 'sub') return options.id;
+        const d = options?.destination;
+        return d === 'low-resolution' || d === 'medium-resolution' || d === 'remote' || d === 'remote-recorder' ? 'sub' : 'main';
+    }
+
+    async getRecordingStream(options: RequestRecordingStreamOptions, _recordingStream?: MediaObject): Promise<MediaObject> {
+        const stream = this.recordingStream(options);
+        const r = this.recorder();
+        const at = await r.recordingAt(this.channel, stream, options.startTime);
+        const duration = options.duration && options.duration > 0 ? options.duration / 1000 : undefined;
+        // the row was just listed by the NVR: a refusal on it is about the route, not a deleted recording
+        const input = await r.input(this.channel, at.row, at.seek, duration, { verified: true });
+        return this.recordingMedia(input, stream, Math.max(options.startTime, at.row.start), options.duration);
+    }
+
+    /** Best effort: where the stream started (the NVR does not report playback progress). */
+    async getRecordingStreamCurrentTime(recordingStream: MediaObject): Promise<number> {
+        const ff = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(recordingStream, ScryptedMimeTypes.FFmpegInput);
+        const t = Number((ff?.mediaStreamOptions as any)?.metadata?.recordingStartTime);
+        if (!Number.isFinite(t)) throw new Error('not a recording stream of this camera');
+        return t;
+    }
+
+    async getRecordingStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const enc = this.nvr.channelCache(this.channel)?.enc;
+        const dim = (s?: { width?: number; height?: number }) => s?.width && s?.height ? { width: s.width, height: s.height } : {};
+        return [
+            { id: 'main', name: 'Main Stream (recording)', container: 'flv', video: dim(enc?.mainStream), tool: 'ffmpeg' } as ResponseMediaStreamOptions,
+            { id: 'sub', name: 'Substream (recording)', container: 'flv', video: dim(enc?.subStream), tool: 'ffmpeg' } as ResponseMediaStreamOptions,
+        ];
+    }
+
+    async getRecordingStreamThumbnail(time: number, _options?: RecordingStreamThumbnailOptions): Promise<MediaObject> {
+        const r = this.recorder();
+        // 10 s buckets: a timeline asking every second shares one decode per bucket
+        const t = Math.floor(time / THUMBNAIL_BUCKET_MS) * THUMBNAIL_BUCKET_MS;
+        const jpeg = await r.thumbnail(`${this.channel}|at|${t}`, async () => {
+            const at = await r.recordingAt(this.channel, 'sub', t);
+            return r.input(this.channel, at.row, at.seek, undefined, { thumbnail: true, verified: true });
+        });
+        return sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -375,6 +527,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             else if (nativeId.includes('-crop-')) d = new ReolinkCropCamera(nativeId, this);
             else if (nativeId.endsWith('-siren')) d = new ReolinkSiren(nativeId, this);
             else if (nativeId.endsWith('-floodlight')) d = new ReolinkFloodlight(nativeId, this);
+            else if (nativeId === nightModeNativeId(this.nativeId!)) d = new ReolinkNightMode(nativeId);
+            else if (nativeId === rawMotionNativeId(this.nativeId!)) d = new ReolinkRawMotion(nativeId);
+            else if (nativeId.startsWith(`${this.nativeId}-raw-`)) d = new ReolinkRawClass(nativeId);
             if (d) this.children.set(nativeId, d);
         }
         return d;
@@ -393,6 +548,21 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         this.settingsListener?.removeListener();
         this.settingsListener = undefined;
     }
+}
+
+/** The camera's raw motion level from each push, exact: the camera's own MotionSensor holds and filters it. */
+export class ReolinkRawMotion extends ScryptedDeviceBase implements MotionSensor {
+    constructor(nativeId: string) { super(nativeId); }
+}
+
+/** One AI class of the camera, its raw level from each push (Camera person, Camera vehicle...); unknown while disconnected. */
+export class ReolinkRawClass extends ScryptedDeviceBase implements OccupancySensor {
+    constructor(nativeId: string) { super(nativeId); }
+}
+
+/** On while the camera is in night mode (IR, black and white); unknown until the NVR has said. */
+export class ReolinkNightMode extends ScryptedDeviceBase implements BinarySensor {
+    constructor(nativeId: string) { super(nativeId); }
 }
 
 /**

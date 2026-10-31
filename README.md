@@ -10,12 +10,26 @@ Polling the HTTP API opens one session per channel and asks for the motion and A
 
 ## Devices
 
-- NVR (one per recorder): settings for host, credentials, HTTP (80), Baichuan (9000), RTSP (554) and RTMP (1935) ports, the channel list (discovered with GetChannelstatus/GetChnTypeInfo, or added by hand), a Discover button and a health line (push state, last event, HTTP sessions in use, reconnects, last error). The cameras' own readers of Rebroadcast (keyframe cache, View, crops) ask for the substream Rebroadcast prebuffers (`RTMP sub.bcs` or `RTSP h264Preview_NN_sub` in its Prebuffered Streams, else its default and low-resolution stream roles), so they add no NVR connection; a camera whose Rebroadcast prebuffers neither logs a warning, as each reader then opens another NVR connection. Substream Protocol (Advanced, RTSP by default) breaks the tie when Rebroadcast prebuffers both and picks when it prebuffers neither; RTSP is used while a channel's type is not discovered yet (it may be a Home Hub, without RTMP). Prefer RTMP `sub.bcs` in Rebroadcast when the audio is used: the NVR's RTSP server stamps each AAC frame with its send time (0 to 170 ms apart for 64 ms frames), which stutters wherever the audio is transcoded, while RTMP steps exactly 64 ms. Scrypted's Rebroadcast logs can show the RTMP password: Reolink RTMP carries the credentials in the URL query string, which Scrypted's log redaction does not hide.
-- Camera per channel (native id `<nvr>-ch<N>`): VideoCamera, Camera (snapshot), MotionSensor, ObjectDetector, Settings, Online.
+- NVR (one per recorder): settings for host, credentials, HTTP (80), Baichuan (9000), RTSP (554) and RTMP (1935) ports, the channel list (discovered with GetChannelstatus/GetChnTypeInfo, or added by hand), a Discover button and a health line (push state, last event, HTTP sessions in use, reconnects, last error). The cameras' own readers of Rebroadcast (keyframe cache, View, crops) ask for the substream Rebroadcast prebuffers (`RTMP sub.bcs` or `RTSP h264Preview_NN_sub` in its Prebuffered Streams, else its default and low-resolution stream roles), so they add no NVR connection; a camera whose Rebroadcast prebuffers neither logs a warning, as each reader then opens another NVR connection. Substream Protocol (Advanced, RTSP by default) breaks the tie when Rebroadcast prebuffers both and picks when it prebuffers neither; RTSP is used while a channel's type is not discovered yet (it may be a Home Hub, without RTMP). Prefer RTMP `sub.bcs` in Rebroadcast when the audio is used: the NVR's RTSP server stamps each AAC frame with its send time (0 to 170 ms apart for 64 ms frames), which stutters wherever the audio is transcoded, while RTMP steps exactly 64 ms. Scrypted's Rebroadcast logs can show the RTMP password: Reolink RTMP carries the credentials in the URL query string, which Scrypted's log redaction does not hide. Recording playback URLs likewise carry the NVR session's token (or, on NVRs that play back only over `/flv`, the account's username and password) to whichever plugin plays them, so use a guest (viewer) account for the plugin.
+- Camera per channel (native id `<nvr>-ch<N>`): VideoCamera, Camera (snapshot), MotionSensor, ObjectDetector, VideoClips, VideoRecorder, Settings, Online.
   - Stream options follow the stock `@scrypted/reolink` plugin exactly (ids such as `h264Preview_04_main`/`_sub` and the RTMP `main.bcs`/`ext.bcs`/`sub.bcs` variants, names, containers, codecs, resolutions), so Rebroadcast and HomeKit see the same streams.
   - Motion and AI classes (people, vehicle, dog_cat, face, package) come from Baichuan push. Settings: Motion Timeout (50 s, extended by each push), Motion Trigger (Motion + AI / AI Only), Ignore Motion After Day/Night Switch.
   - Siren and Floodlight children (OnOff) when the channel supports them.
+  - Children on every camera: **Night mode** (BinarySensor, on while the camera is in IR / black and white, from the NVR's day/night push and read once at connection) and **Camera motion** (MotionSensor, the camera's raw motion level from each push, with no hold or trigger rule). When the last AI class clears, the camera emits one empty detection list.
+  - Smart events (`line_crossing`, `intrusion`, `loitering`, `forgotten_item`, `taken_item`) as detections, only on channels whose abilities report them.
 - Sessions: one Baichuan connection and at most one HTTP API session per NVR, reused by every camera, logged out on stop, with backoff after failed logins. No polling.
+
+## Recordings
+
+Each camera also implements Scrypted's VideoClips and VideoRecorder from the NVR's own recordings, so any plugin can list, play and download them. A guest account is enough.
+
+- **Clips:** substream recordings in 5 minute windows. Each clip has its trigger types (person, vehicle, animal, motion…) from the NVR's alarm-video search, and a small JPEG thumbnail. On 24/7 recorders, windows with no trigger are left out.
+- **Recording streams:** play from any time, from the main stream or the substream. With a duration the stream is bounded, so it can be downloaded.
+- **Time zones:** recording times are converted with the NVR's own time zone and DST rules. The playback endpoint the NVR answers on is measured once per run. Searches are cached and run one at a time.
+
+- **Limits:** at most 3 playback streams and thumbnails at once per NVR (else "NVR playback busy"); clips are at most a day long; clip ids are signed per install and bound to their camera.
+
+Nothing is ever deleted on the NVR. See [docs/recordings.md](docs/recordings.md) for the design notes and the fixes they carry over from Reolink Stamina.
 
 ## What is inside
 

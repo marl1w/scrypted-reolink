@@ -90,3 +90,24 @@ test('raw reports every push as the camera states it, ignoring trigger rules and
     assert.deepEqual(raw, ['true:', 'true:people', 'false:', 'undefined:']);
     m.dispose();
 });
+
+test('the last class clearing emits one empty detection list; pulses only while classes are active', async () => {
+    const { m, log } = setup({ repeatMs: 20, timeoutMs: 1000 });
+    m.handle(alarm(true, ['people']));
+    await sleep(50);
+    const pulses = log.filter(l => l === 'det=people').length;
+    assert.ok(pulses >= 2, `pulses while active (${pulses})`);
+    m.handle(alarm(true));
+    assert.equal(log.at(-1), 'det=', 'cleared at once');
+    await sleep(50);
+    assert.equal(log.filter(l => l === 'det=').length, 1, 'once');
+    assert.equal(log.filter(l => l === 'det=people').length, pulses, 'no pulse after clearing');
+    m.handle(alarm(false));
+    assert.equal(log.filter(l => l === 'det=').length, 1, 'nothing to clear twice');
+    m.handle(alarm(true, ['vehicle']));
+    m.reset();
+    assert.equal(log.at(-1), 'det=', 'connection lost with a class active: cleared');
+    m.reset();
+    assert.equal(log.filter(l => l === 'det=').length, 2);
+    m.dispose();
+});

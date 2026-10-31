@@ -226,6 +226,13 @@ export class BaichuanClient extends EventEmitter<BaichuanClientEvents> {
         return (channel === undefined ? await c.request(cmd) : await c.channelCommand(cmd, channel, '')).xml;
     }
 
+    /** A read for one channel with a request body (searches); resolves to the reply XML. */
+    async channelQuery(cmd: number, channel: number, xml: string, timeoutMs?: number): Promise<string> {
+        const c = this.conn;
+        if (!c || c.isClosed || this.stats.state !== 'subscribed') throw new Error('Baichuan session not connected');
+        return (await c.channelCommand(cmd, channel, xml, timeoutMs)).xml;
+    }
+
     private onPush(f: Frame, xml: string) {
         if (f.cmd !== Cmd.AlarmEvent) {
             this.emit('push', f, xml);

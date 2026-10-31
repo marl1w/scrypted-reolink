@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, parseCrops, parseMirrors, parseViewCrop, cameraNativeId, cameraSerialNumber, channelCacheFrom, distinctSerials, formatHealth, parseCameraNativeId, realId, slugTag } from '../src/devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, parseCrops, parseMirrors, parseViewCrop, cameraNativeId, cameraSerialNumber, channelCacheFrom, distinctSerials, formatHealth, nightModeNativeId, parseCameraNativeId, rawClassNativeId, rawMotionNativeId, realId, slugTag } from '../src/devices';
 
 const ability = { abilityChn: [{ supportAudioAlarm: { ver: 1 } }, {}, { floodLight: { ver: 1 } }] };
 
@@ -17,7 +17,7 @@ test('camera device manifest', () => {
     assert.equal(d.providerNativeId, 'nvr-1');
     assert.equal(d.name, 'Cam B');
     assert.equal(d.type, 'Camera');
-    assert.deepEqual(d.interfaces, ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'Settings', 'Online', 'DeviceProvider']);
+    assert.deepEqual(d.interfaces, ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'Settings', 'Online', 'VideoClips', 'VideoRecorder', 'DeviceProvider']);
     assert.equal(d.info?.model, 'CAM-TEST');
     assert.equal(d.info?.serialNumber, '95270000TESTUID');
     assert.equal(cache.exactType, 'NVR');
@@ -47,15 +47,22 @@ test('a serial two channels share is dropped', () => {
         [[0, 'A1'], [1, undefined], [2, undefined], [3, undefined]]);
 });
 
-test('no siren/floodlight: no DeviceProvider, default name', () => {
+test('no siren/floodlight: still a DeviceProvider (Night mode, Camera motion), default name, recordings', () => {
     const d = buildCameraDevice('nvr-1', { channel: 1, ability });
     assert.equal(d.name, 'Channel 2');
-    assert.equal(d.interfaces.includes('DeviceProvider'), false);
+    assert.ok(d.interfaces.includes('DeviceProvider'));
+    assert.ok(d.interfaces.includes('VideoClips') && d.interfaces.includes('VideoRecorder'));
 });
 
-test('siren and floodlight children use the stock suffixes and types', () => {
-    assert.deepEqual(buildChildDevices('nvr-1-ch0', 'Cam A', { channel: 0, ability }).map(d => [d.nativeId, d.name, d.type, d.interfaces]), [['nvr-1-ch0-siren', 'Cam A Siren', 'Siren', ['OnOff']]]);
-    assert.deepEqual(buildChildDevices('nvr-1-ch2', 'Cam B', { channel: 2, ability }).map(d => [d.nativeId, d.type]), [['nvr-1-ch2-floodlight', 'Light']]);
+test('Night mode and Camera motion on every camera; siren and floodlight with the stock suffixes and types', () => {
+    assert.deepEqual(buildChildDevices('nvr-1-ch1', 'Cam C', { channel: 1, ability }).map(d => [d.nativeId, d.providerNativeId, d.name, d.type, d.interfaces]), [
+        ['nvr-1-ch1-nightmode', 'nvr-1-ch1', 'Cam C Night mode', 'Sensor', ['BinarySensor']],
+        ['nvr-1-ch1-rawmotion', 'nvr-1-ch1', 'Cam C Camera motion', 'Sensor', ['MotionSensor']],
+    ]);
+    assert.equal(nightModeNativeId('nvr-1-ch1'), 'nvr-1-ch1-nightmode');
+    assert.equal(rawMotionNativeId('nvr-1-ch1'), 'nvr-1-ch1-rawmotion');
+    assert.deepEqual(buildChildDevices('nvr-1-ch0', 'Cam A', { channel: 0, ability }).slice(2).map(d => [d.nativeId, d.name, d.type, d.interfaces]), [['nvr-1-ch0-siren', 'Cam A Siren', 'Siren', ['OnOff']]]);
+    assert.deepEqual(buildChildDevices('nvr-1-ch2', 'Cam B', { channel: 2, ability }).slice(2).map(d => [d.nativeId, d.type]), [['nvr-1-ch2-floodlight', 'Light']]);
 });
 
 test('health line', () => {
@@ -107,4 +114,29 @@ test('crop and mirror serials: source serial and a short tag, no names', () => {
     assert.match(m.mirrors[0].info!.serialNumber!, /^141400000000001-mirror-[0-9a-f]{6}$/);
     assert.notEqual(slugTag('parking-spot'), slugTag('gate'));
     assert.equal(buildCropDevices('nvr-1-ch8', crops).at(0)?.info?.serialNumber, undefined);
+});
+
+test('a Camera <class> child per supported AI class, named as the MQTT add-on names its entities', () => {
+    const kids = buildChildDevices('nvr-1-ch1', 'Cam C', { channel: 1, ability, aiClasses: ['people', 'vehicle', 'dog_cat', 'face', 'package', 'bad-Class'] });
+    assert.deepEqual(kids.filter(d => d.nativeId.includes('-raw-')).map(d => [d.nativeId, d.name, d.type, d.interfaces]), [
+        ['nvr-1-ch1-raw-person', 'Cam C Camera person', 'Sensor', ['OccupancySensor']],
+        ['nvr-1-ch1-raw-vehicle', 'Cam C Camera vehicle', 'Sensor', ['OccupancySensor']],
+        ['nvr-1-ch1-raw-animal', 'Cam C Camera animal', 'Sensor', ['OccupancySensor']],
+        ['nvr-1-ch1-raw-face', 'Cam C Camera face', 'Sensor', ['OccupancySensor']],
+        ['nvr-1-ch1-raw-package', 'Cam C Camera package', 'Sensor', ['OccupancySensor']],
+    ]);
+    assert.equal(rawClassNativeId('x', 'some_class'), 'x-raw-some_class');
+    assert.equal(buildChildDevices('nvr-1-ch1', 'Cam C', { channel: 1, ability }).filter(d => d.nativeId.includes('-raw-')).length, 0);
+});
+
+test('children of fields not read yet are kept as announced; read fields decide', () => {
+    const existing = ['nvr-1-ch0-siren', 'nvr-1-ch0-floodlight', 'nvr-1-ch0-raw-person', 'nvr-1-ch0-raw-some_class', 'nvr-1-ch1-siren'];
+    const unknown = buildChildDevices('nvr-1-ch0', 'Cam A', { channel: 0 }, existing);
+    assert.deepEqual(unknown.map(d => [d.nativeId, d.name]), [
+        ['nvr-1-ch0-nightmode', 'Cam A Night mode'], ['nvr-1-ch0-rawmotion', 'Cam A Camera motion'],
+        ['nvr-1-ch0-raw-person', 'Cam A Camera person'], ['nvr-1-ch0-raw-some_class', 'Cam A Camera some class'],
+        ['nvr-1-ch0-siren', 'Cam A Siren'], ['nvr-1-ch0-floodlight', 'Cam A Floodlight'],
+    ]);
+    const known = buildChildDevices('nvr-1-ch0', 'Cam A', { channel: 0, ability: { abilityChn: [{}] }, aiClasses: [] }, existing);
+    assert.deepEqual(known.map(d => d.nativeId), ['nvr-1-ch0-nightmode', 'nvr-1-ch0-rawmotion'], 'read: removed');
 });

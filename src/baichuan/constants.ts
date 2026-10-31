@@ -20,6 +20,12 @@ export const Cmd = {
     SirenStatus: 547, // push: siren state per channel, also when the camera sounds it itself (reolink_aio, HA's siren entity)
     VersionInfo: 318, // VersionInfo of one channel's camera, with its serial number (verified)
     UdpHeartbeat: 234,
+    Record: 81, // a channel's recording switch, `enable` (verified, guest)
+    Support: 199, // abilities per channel, `smartAI` bits (verified, guest)
+    DayNight: 296, // a channel's day/night state, `stat` (verified, guest)
+    AlarmVideoOpen: 272, // alarm-video search: open, returns a file handle (verified, guest)
+    AlarmVideoNext: 273, // alarm-video search: next page of trigger windows (verified, guest)
+    AlarmVideoClose: 274, // alarm-video search: close the handle (verified, guest)
 } as const;
 
 // Message class, header bytes 18-19 read as hex.

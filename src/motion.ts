@@ -14,7 +14,10 @@ export interface MotionConfig {
 
 export interface MotionSink {
     setMotion(on: boolean): void;
-    /** Class names exactly as the device reports them (people, vehicle, dog_cat, face, package). */
+    /**
+     * Class names exactly as the device reports them (people, vehicle, dog_cat, face, package), then smart events;
+     * repeated while active, and an empty list once when the last class clears.
+     */
     detections(classes: string[]): void;
     dayNight?(mode: string): void;
     /** The camera's own state as each push reports it, with no hold or trigger rule; undefined motion when the connection is lost. */
@@ -48,11 +51,15 @@ export class MotionController {
             return;
         }
         const c = this.cfg();
-        const classes = [...ev.ai].filter(a => !NON_DETECTION.has(a));
+        // smart events (line crossing, intrusion...) are detections like the AI classes; the camera passes only supported ones
+        const classes = [...[...ev.ai].filter(a => !NON_DETECTION.has(a)), ...(ev.smart ?? [])];
         this.sink.raw?.(!!ev.motion, classes);
         const suppressed = c.trigger === 'AI Only' || (c.dayNightIgnoreMs > 0 && this.now() - this.lastDayNightAt < c.dayNightIgnoreMs);
         const raw = ev.motion && !suppressed;
+        const cleared = this.activeClasses.length > 0 && !classes.length;
         this.activeClasses = classes;
+        // once when the last class goes: consumers turn classes off exactly, not on a timeout
+        if (cleared) this.sink.detections([]);
         if (classes.length || raw) {
             this.activate();
             if (!this.repeatTimer)
@@ -81,8 +88,9 @@ export class MotionController {
         this.repeatTimer = undefined;
     }
 
-    /** Connection lost: stop extending; the hold timer still ends motion. */
+    /** Connection lost: stop extending; the hold timer still ends motion. Active classes are cleared once. */
     reset() {
+        if (this.activeClasses.length) this.sink.detections([]);
         this.activeClasses = [];
         this.stopRepeat();
         this.sink.raw?.(undefined, []);

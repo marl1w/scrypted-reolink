@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<AlarmEventList version="1.1">
+<AlarmEvent version="1.1">
+<channelId>1</channelId>
+<status>MD</status>
+<recording>1</recording>
+<timeStamp>0</timeStamp>
+<AItype>people</AItype>
+<smartAiTypeList>
+<smartAiType>
+<type>crossline</type>
+<index>2</index>
+</smartAiType>
+<smartAiType>
+<type>intrusion</type>
+<index>0</index>
+</smartAiType>
+<smartAiType>
+<type>loitering</type>
+<index>0</index>
+<subList><index>1</index><type>people</type></subList>
+</smartAiType>
+<smartAiType>
+<type>somethingnew</type>
+<index>1</index>
+</smartAiType>
+</smartAiTypeList>
+</AlarmEvent>
+</AlarmEventList>
+</body>

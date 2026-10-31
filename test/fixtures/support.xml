@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<Support version="1.1">
+<IOInputPortNum>0</IOInputPortNum>
+<item>
+<chnID>0</chnID>
+<smartAI>0</smartAI>
+<aitype>3895</aitype>
+</item>
+<item>
+<chnID>1</chnID>
+<smartAI>6</smartAI>
+<aitype>3895</aitype>
+</item>
+<item>
+<chnID>2</chnID>
+<smartAI>62</smartAI>
+</item>
+</Support>
+</body>

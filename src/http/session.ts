@@ -47,6 +47,12 @@ const RSP_LOGIN_FIRST = -6;
 export class HttpSession {
     private token?: string;
     private leaseEnd = 0;
+    private leaseMs = 3_600_000;
+    /**
+     * Tokens replaced while still valid: not logged out, so playback URLs already handed out keep working until they
+     * expire on their own; logged out on stop.
+     */
+    private retired: { token: string; end: number }[] = [];
     private loginPromise?: Promise<string>;
     private nextLoginAt = 0;
     private backoff: number;
@@ -60,8 +66,11 @@ export class HttpSession {
 
     private now() { return (this.opts.now ?? Date.now)(); }
 
-    /** 1 while a token is held, else 0. Never more. */
-    get sessionsInUse() { return this.token ? 1 : 0; }
+    /** Tokens held: the current one, plus replaced ones not expired yet. */
+    get sessionsInUse() {
+        const now = this.now();
+        return (this.token ? 1 : 0) + this.retired.filter(r => r.end > now).length;
+    }
 
     private base() { return `${this.opts.host}:${this.opts.port ?? 80}`; }
 
@@ -107,7 +116,8 @@ export class HttpSession {
             }
             this.logins++;
             this.token = tok.name;
-            this.leaseEnd = this.now() + 1000 * (Number(tok.leaseTime) || 3600);
+            this.leaseMs = 1000 * (Number(tok.leaseTime) || 3600);
+            this.leaseEnd = this.now() + this.leaseMs;
             this.backoff = this.opts.backoffMinMs ?? 5000;
             this.nextLoginAt = 0;
             return tok.name;
@@ -120,13 +130,23 @@ export class HttpSession {
         }
     }
 
-    /** Returns a valid token, logging in (single flight) only when needed. */
-    async getToken(): Promise<string> {
-        if (this.token && this.now() < this.leaseEnd - (this.opts.renewMarginMs ?? 60000))
+    /**
+     * Returns a valid token, logging in (single flight) only when needed. `minRemainingMs`: renew early unless the
+     * token stays valid at least this long (a playback URL handed to ffmpeg must outlive its stream's start).
+     */
+    async getToken(minRemainingMs = 0): Promise<string> {
+        // never more than most of a lease, or a short lease would renew on every call
+        const need = Math.max(this.opts.renewMarginMs ?? 60000, Math.min(minRemainingMs, this.leaseMs * 0.75));
+        if (this.token && this.now() < this.leaseEnd - need)
             return this.token;
         if (!this.loginPromise) {
             this.loginPromise = (async () => {
-                if (this.token) await this.logout();
+                // replaced while still valid: left to expire, so URLs carrying it keep working (never logged out early)
+                const now = this.now();
+                this.retired = this.retired.filter(r => r.end > now);
+                if (this.token && now < this.leaseEnd) this.retired.push({ token: this.token, end: this.leaseEnd });
+                else if (this.token) await this.logout();
+                this.invalidate();
                 return this.login();
             })().finally(() => { this.loginPromise = undefined; });
         }
@@ -212,6 +232,13 @@ export class HttpSession {
         this.stopped = true;
         try { await this.loginPromise; } catch { /* ignore */ }
         await this.logout();
+        // every login is paired with a logout: replaced tokens still valid are logged out too
+        const now = this.now(), retired = this.retired.filter(r => r.end > now);
+        this.retired = [];
+        for (const r of retired) {
+            try { await this.raw('POST', `/api.cgi?cmd=Logout&token=${encodeURIComponent(r.token)}`, [{ cmd: 'Logout', action: 0, param: {} }], 3000); }
+            catch { /* best effort */ }
+        }
     }
 }
 

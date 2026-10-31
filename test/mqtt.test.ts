@@ -19,3 +19,12 @@ test('raw entities: camera motion plus one occupancy per supported AI class, nam
         ['dog_cat', 'Camera animal', 'front_door_camera_animal', 'occupancy'],
     ]);
 });
+
+test('the raw child devices carry the add-on entity names, so the bridge can hand the entities over', () => {
+    const { buildChildDevices } = require('../src/devices');
+    const classes = ['people', 'vehicle', 'dog_cat', 'face', 'package'];
+    const addon = rawEntities('Cam C', classes).map((x: any) => `Cam C ${x.name}`);
+    const kids = buildChildDevices('nvr-1-ch1', 'Cam C', { channel: 1, aiClasses: classes })
+        .filter((d: any) => d.nativeId.includes('-raw')).map((d: any) => d.name);
+    assert.deepEqual(kids, addon);
+});

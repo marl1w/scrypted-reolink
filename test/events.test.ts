@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { formatEvent, parseAlarmEvents, parseFloodlightStatus, parseSirenStatus } from '../src/baichuan/events';
+import { MotionController } from '../src/motion';
 import { parseDeviceInfo } from '../src/baichuan/connection';
 
 // Tests run from out-test/test; fixtures stay in the source tree.
@@ -21,7 +22,9 @@ test('multi-channel AlarmEventList', () => {
     assert.deepEqual([...ev[2].ai].sort(), ['dog_cat', 'face', 'package']);
     assert.deepEqual(ev[2].status, ['MD', 'visitor']);
     assert.equal(ev[2].timestamp, 1791886000);
-    assert.equal(formatEvent(ev[2]), 'ch11 motion=1 ai=dog_cat,face,package status=visitor');
+    assert.deepEqual(ev[2].smart, ['line_crossing']);
+    assert.deepEqual(ev[0].smart, []);
+    assert.equal(formatEvent(ev[2]), 'ch11 motion=1 ai=dog_cat,face,package status=visitor smart=line_crossing');
     assert.equal(formatEvent(ev[1]), 'ch3 motion=0 ai=none');
 });
 
@@ -67,4 +70,22 @@ test('siren status pushes: channel and state of each SirenStatus', () => {
 test('siren status pushes: entries without a numeric channel or status are skipped', () => {
     const xml = '<?xml version="1.0" encoding="UTF-8" ?><body><SirenStatus><channel>2</channel></SirenStatus><SirenStatus><channel>x</channel><status>1</status></SirenStatus><Other><channel>3</channel><status>1</status></Other></body>';
     assert.deepEqual(parseSirenStatus(xml), []);
+});
+
+test('smart events: active by index bitmap or sub entries, idle at index 0, unknown types ignored', () => {
+    const [ev] = parseAlarmEvents(fx('alarm-smart.xml'));
+    assert.equal(ev.channel, 1);
+    assert.deepEqual(ev.smart, ['line_crossing', 'loitering']);
+    assert.deepEqual([...ev.ai], ['people']);
+});
+
+test('smart events become detections with the AI classes', () => {
+    const det: string[][] = [];
+    const m = new MotionController(() => ({ timeoutMs: 1000, dayNightIgnoreMs: 0, trigger: 'AI Only', repeatMs: 10000 }), { setMotion: () => { }, detections: c => det.push(c) });
+    const [ev] = parseAlarmEvents(fx('alarm-smart.xml'));
+    m.handle(ev);
+    assert.deepEqual(det, [['people', 'line_crossing', 'loitering']]);
+    m.handle({ ...ev, ai: new Set(), smart: ['intrusion'] });
+    assert.deepEqual(det.at(-1), ['intrusion'], 'smart alone counts, even for AI Only');
+    m.dispose();
 });

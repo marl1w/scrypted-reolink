@@ -1,18 +1,24 @@
 import sdk, { DeviceProvider, Online, ScryptedDeviceBase, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { randomBytes } from 'node:crypto';
 import { BaichuanClient } from './baichuan/client';
 import { Cmd } from './baichuan/constants';
 import { formatEvent, parseFloodlightStatus, parseSirenStatus, PushEvent } from './baichuan/events';
-import { parseMac, parseUid, parseVersionInfo } from './baichuan/info';
+import { parseDayNightState, parseMac, parseRecordEnable, parseSmartAiSupport, parseUid, parseVersionInfo, smartAiClasses } from './baichuan/info';
 import { Frame } from './baichuan/frame';
 import { ReolinkChannelCamera } from './camera';
 import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, cameraSerialNumber, ChannelCache, channelCacheFrom, distinctSerials, formatHealth, NvrIds, parseCameraNativeId, parseCrops, parseMirrors, realId } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
+import { NvrRecordings } from './recorder';
 import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
 const NVR_IDS = 'nvrIds';
+/** Smart AI support bits per channel (Baichuan cmd 199 `smartAI`), JSON `{ "<channel>": bits }`. */
+const SMART_AI = 'smartAi';
+/** This install's key for signing clip ids (hex), created once. */
+const CLIP_KEY = 'clipKey';
 
 /**
  * One Reolink NVR: exactly one Baichuan push connection and at most one HTTP API session,
@@ -49,10 +55,26 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             onPut: () => this.discover(),
         },
         logEvents: { title: 'Log Push Events', type: 'boolean', subgroup: 'Advanced' },
+        playbackSlots: {
+            title: 'Recording Playback Streams',
+            description: 'Recording streams and thumbnails this plugin opens on the NVR at once. Set it to what the NVR allows minus what other consumers (the Reolink app, Home Assistant, Stamina) play back at the same time.',
+            type: 'number',
+            defaultValue: 3,
+            subgroup: 'Advanced',
+        },
     });
 
     session?: HttpSession;
     private _api?: NvrApi;
+    /** Recordings search and playback, on the shared HTTP session and Baichuan connection. */
+    recordings?: NvrRecordings;
+    /** Night mode and recording state per channel as last read, for cameras created after the read. */
+    readonly channelStates = new Map<number, { dayNight?: string; recording?: boolean }>();
+    private statesRead?: Promise<void>;
+    /** Smart AI support bits per channel, parsed once from storage and updated by readStates. */
+    private smart?: Record<string, number>;
+    /** Native ids announced to Scrypted: no state is written to a child before it exists. */
+    private announced = new Set<string>();
     push?: BaichuanClient;
     private cameras = new Map<string, ReolinkChannelCamera>();
     private lastEventAt?: number;
@@ -69,6 +91,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     get password() { return String(this.storageSettings.values.password || ''); }
     get rtspPort() { return Number(this.storageSettings.values.rtspPort) || 554; }
     get rtmpPort() { return Number(this.storageSettings.values.rtmpPort) || 1935; }
+    get playbackSlots() { return Math.max(1, Math.min(16, Math.floor(Number(this.storageSettings.values.playbackSlots) || 3))); }
     get substreamProtocol(): SubstreamProtocol { return parseSubstreamProtocol(this.storageSettings.values.substreamProtocol); }
 
     get api(): NvrApi {
@@ -83,6 +106,18 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         }
         this.session = new HttpSession({ host: this.host, port: Number(this.storageSettings.values.httpPort) || 80, username: this.username, password: this.password });
         this._api = new NvrApi(this.session);
+        const session = this.session;
+        this.recordings = new NvrRecordings({
+            api: () => this.api,
+            token: min => session.getToken(min),
+            slots: () => this.playbackSlots,
+            target: () => ({ host: this.host, port: Number(this.storageSettings.values.httpPort) || 80, rtmpPort: this.rtmpPort, username: this.username, password: this.password }),
+            baichuan: () => this.push?.state === 'subscribed' ? this.push : undefined,
+            uid: ch => this.channelCache(ch)?.uid,
+            clipKey: () => this.clipKey(),
+            ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
+            log: m => this.console.log(m),
+        });
         const push = new BaichuanClient({ host: this.host, port: Number(this.storageSettings.values.baichuanPort) || 9000, username: this.username, password: this.password });
         this.push = push;
         push.on('state', s => {
@@ -94,8 +129,14 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             // once per start: serials only change when a camera is replaced, and Discover reads them again
             if (s === 'subscribed' && !this.identityRead) {
                 this.identityRead = true;
-                this.refreshIdentity().then(changed => { if (changed) return this.syncDevices(); })
-                    .catch(e => this.console.warn(`serial numbers: ${(e as Error).message}`));
+                // once per start, changed or not: an update may add interfaces or children to existing devices
+                this.refreshIdentity().catch(e => this.console.warn(`serial numbers: ${(e as Error).message}`))
+                    .then(() => this.storageSettings.values.channels?.length ? this.syncDevices() : undefined)
+                    .catch(e => this.console.warn(`devices: ${(e as Error).message}`))
+                    .then(() => this.readChannelStates());
+            }
+            else if (s === 'subscribed') {
+                void this.readChannelStates();
             }
         });
         push.on('warn', e => this.console.warn(`push: ${e.message}`));
@@ -130,6 +171,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         this.push = undefined;
         this.session = undefined;
         this._api = undefined;
+        this.recordings = undefined;
         this.identityRead = false;
         await Promise.all([p?.stop(), s?.stop()]);
     }
@@ -142,6 +184,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     private onPush(ev: PushEvent) {
         this.lastEventAt = Date.now();
         if (this.storageSettings.values.logEvents) this.console.log(formatEvent(ev));
+        if (ev.kind === 'daynight' && ev.dayNight) this.channelStates.set(ev.channel, { ...this.channelStates.get(ev.channel), dayNight: ev.dayNight });
         this.cameras.get(cameraNativeId(this.nativeId!, ev.channel))?.onPush(ev);
     }
 
@@ -200,6 +243,69 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         return changed;
     }
 
+    /**
+     * Read once per Baichuan session, all read-only: smart AI support (cmd 199), then per channel the day/night state
+     * (cmd 296, so Night mode is known before the first switch) and whether it records (cmd 81). No HTTP login.
+     */
+    readChannelStates(): Promise<void> {
+        this.statesRead ??= this.readStates().finally(() => { this.statesRead = undefined; });
+        return this.statesRead;
+    }
+
+    private async readStates() {
+        const push = this.push;
+        if (!push || push.state !== 'subscribed') return;
+        const smart = parseSmartAiSupport(await push.query(Cmd.Support).catch(() => ''));
+        if (smart.size) {
+            const before = this.storage.getItem(SMART_AI);
+            const now = JSON.stringify(Object.fromEntries(smart));
+            if (before !== now) {
+                this.storage.setItem(SMART_AI, now);
+                this.smart = Object.fromEntries(smart);
+                const supported = [...smart].filter(([, b]) => smartAiClasses(b).length).map(([ch, b]) => `ch${ch} ${smartAiClasses(b).join(',')}`);
+                this.console.log(`smart events: ${supported.join('; ') || 'none supported'}`);
+            }
+        }
+        const chans: number[] = (this.storageSettings.values.channels ?? []).map((x: any) => parseInt(String(x), 10)).filter((n: number) => !isNaN(n));
+        for (const ch of chans) {
+            if (this.push !== push || push.state !== 'subscribed') return;
+            if (this.channelCache(ch)?.online === false) continue;
+            const dayNight = parseDayNightState(await push.query(Cmd.DayNight, ch).catch(() => ''));
+            const recording = parseRecordEnable(await push.query(Cmd.Record, ch).catch(() => ''));
+            const st = this.channelStates.get(ch) ?? {};
+            if (dayNight !== undefined) st.dayNight = dayNight;
+            if (recording !== undefined) st.recording = recording;
+            this.channelStates.set(ch, st);
+            const cam = this.cameras.get(cameraNativeId(this.nativeId!, ch));
+            if (dayNight !== undefined) cam?.nightModeState(dayNight);
+            if (recording !== undefined) cam?.recordingState(recording);
+        }
+    }
+
+    /** Smart events a channel supports, from its cmd 199 `smartAI` bits. */
+    smartEvents(channel: number): string[] {
+        if (!this.smart) {
+            try { this.smart = JSON.parse(this.storage.getItem(SMART_AI) || '{}'); }
+            catch { this.smart = {}; }
+        }
+        return smartAiClasses(this.smart![channel]);
+    }
+
+    private clipKey(): Buffer {
+        let k = this.storage.getItem(CLIP_KEY);
+        if (!k || !/^[0-9a-f]{64}$/.test(k)) {
+            k = randomBytes(32).toString('hex');
+            this.storage.setItem(CLIP_KEY, k);
+        }
+        return Buffer.from(k, 'hex');
+    }
+
+    /** Whether a native id has been announced to Scrypted (by this run's syncDevices, or a previous run). */
+    isAnnounced(nativeId: string): boolean {
+        if (!this.announced.size) for (const id of sdk.deviceManager.getNativeIds()) if (id) this.announced.add(id);
+        return this.announced.has(nativeId);
+    }
+
     snapshot(channel: number, timeoutMs?: number) {
         if (!this.session) throw new Error('NVR not configured');
         return this.session.snapshot(channel, timeoutMs);
@@ -243,13 +349,18 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             const storage = sdk.deviceManager.getDeviceStorage(camId);
             const crops = parseCrops(JSON.parse(storage?.getItem('crops') || '[]'));
             const mirrors = buildMirrorDevices(camId, parseMirrors(JSON.parse(storage?.getItem('mirrors') || '[]'), crops), cache.serialNumber);
-            const children = [...buildChildDevices(camId, name, cache), ...buildCropDevices(camId, crops, cache.serialNumber), ...mirrors.mirrors];
-            if (children.length)
-                await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
+            this.isAnnounced(camId);
+            const children = [...buildChildDevices(camId, name, cache, [...this.announced]), ...buildCropDevices(camId, crops, cache.serialNumber), ...mirrors.mirrors];
+            // always sent, even when only the fixed children are left: removed crops and mirrors go with it
+            await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
             for (const m of mirrors.mirrors)
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: m.nativeId, devices: mirrors.children.filter(c => c.providerNativeId === m.nativeId) as any });
+            for (const a of [...this.announced]) if (a.startsWith(`${camId}-`)) this.announced.delete(a);
+            for (const d of [{ nativeId: camId }, ...children, ...mirrors.children]) this.announced.add(d.nativeId);
         }
         this.updateCameraOnline();
+        // children announced only now get the states known so far
+        for (const c of this.cameras.values()) c.applyChildStates();
     }
 
     /** The Substream Protocol changed: running keyframe caches read the substream again. */

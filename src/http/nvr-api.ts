@@ -1,4 +1,5 @@
-import { ApiResult, HttpSession } from './session';
+import type { RawFile, RecordingStreamType, ReolinkTime, TimeSettings } from '../recordings';
+import { ApiError, ApiResult, HttpSession } from './session';
 
 // Typed wrappers over the NVR JSON API, all through the one shared HttpSession.
 
@@ -85,6 +86,23 @@ export class NvrApi {
             enc: find(rs, 'GetEnc')?.value?.Enc,
             ai,
         };
+    }
+
+    /** Time, time zone and DST rules: recording times are stated in the recorder's own wall clock. */
+    async time(): Promise<TimeSettings> {
+        const v = await this.session.one({ cmd: 'GetTime' });
+        if (!v?.Time) throw new ApiError('GetTime: no Time in the answer');
+        return v;
+    }
+
+    /**
+     * Recordings of one channel and stream between two recorder wall clocks (cmd Search, as reolink_aio sends it).
+     * No `File` in the answer means no recordings in the window, not an error.
+     */
+    async search(channel: number, stream: RecordingStreamType, start: ReolinkTime, end: ReolinkTime): Promise<RawFile[]> {
+        const v = await this.session.one({ cmd: 'Search', param: { Search: { channel, onlyStatus: 0, streamType: stream, StartTime: start, EndTime: end } } });
+        const files = v?.SearchResult?.File;
+        return Array.isArray(files) ? files : [];
     }
 
     /** Same bodies as the stock plugin (AudioAlarmPlay, manual switch). */
