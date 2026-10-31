@@ -1,5 +1,7 @@
 import sdk, { Camera, DeviceProvider, EventListenerRegister, MediaObject, MediaStreamUrl, MotionSensor, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { Cmd } from './baichuan/constants';
+import { floodlightXml, sirenXml } from './baichuan/events';
 import { rawEntities, reolinkMqtt } from './mqtt';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
@@ -109,6 +111,13 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     private rawKnown = false;
     private rawConfigKey = '';
     private rawLast: { motion: boolean | undefined; classes: string[] } = { motion: undefined, classes: [] };
+
+    /** The floodlight's state as the NVR pushes it (it also switches by itself, on motion or schedule). */
+    floodlightState(on: boolean) {
+        this.getDevice(`${this.nativeId}-floodlight`).then((f?: ReolinkFloodlight) => {
+            if (f && f.on !== on) f.on = on;
+        }).catch(() => { /* no floodlight on this channel */ });
+    }
 
     /** Subscribed again: until the next push says otherwise, nothing is active. */
     rawSubscribed() {
@@ -280,16 +289,38 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     }
 }
 
+/**
+ * Siren and floodlight switch over the NVR's Baichuan session (as reolink_aio does): the HTTP AudioAlarmPlay and
+ * SetWhiteLed are refused by NVR channels (rspCode -26).
+ */
 export class ReolinkSiren extends ScryptedDeviceBase implements OnOff {
     constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
-    async turnOn() { await this.camera.nvr.api.setSiren(this.camera.channel, true); this.on = true; }
-    async turnOff() { await this.camera.nvr.api.setSiren(this.camera.channel, false); this.on = false; }
+    async turnOn() {
+        const push = this.camera.nvr.pushClient(), ch = this.camera.channel;
+        // some firmware refuses a manual play: two timed plays instead, as reolink_aio falls back
+        await push.channelCommand(Cmd.AudioAlarmPlay, ch, sirenXml(ch, true))
+            .catch(() => push.channelCommand(Cmd.AudioAlarmPlay, ch, sirenXml(ch, true, 2)));
+        this.on = true;
+    }
+    async turnOff() {
+        const ch = this.camera.channel;
+        await this.camera.nvr.pushClient().channelCommand(Cmd.AudioAlarmPlay, ch, sirenXml(ch, false));
+        this.on = false;
+    }
 }
 
 export class ReolinkFloodlight extends ScryptedDeviceBase implements OnOff {
     constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
-    async turnOn() { await this.camera.nvr.api.setWhiteLed(this.camera.channel, true); this.on = true; }
-    async turnOff() { await this.camera.nvr.api.setWhiteLed(this.camera.channel, false); this.on = false; }
+    async turnOn() {
+        const ch = this.camera.channel;
+        await this.camera.nvr.pushClient().channelCommand(Cmd.FloodlightManual, ch, floodlightXml(ch, true));
+        this.on = true;
+    }
+    async turnOff() {
+        const ch = this.camera.channel;
+        await this.camera.nvr.pushClient().channelCommand(Cmd.FloodlightManual, ch, floodlightXml(ch, false));
+        this.on = false;
+    }
 }
 
 /**

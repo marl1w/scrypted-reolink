@@ -13,6 +13,9 @@ const st = (n: number) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); retur
 
 /** Minimal Baichuan device for tests: nonce, login check, subscribe, keep-alive, logout, pushes. */
 export class MockNvr {
+    /** Channel commands received (decrypted extension and body). */
+    commands: { cmd: number; chId: number; ext: string; body: string }[] = [];
+    refuseCommands = false;
     server?: Server;
     port = 0;
     nonce = 'ABCDEF0123456789';
@@ -84,6 +87,14 @@ export class MockNvr {
             return this.reply(s, f, st(402));
         if (f.cmd === Cmd.LinkType)
             return this.reply(s, f, ok);
+        if (f.cmd === Cmd.FloodlightManual || f.cmd === Cmd.AudioAlarmPlay) {
+            this.commands.push({
+                cmd: f.cmd, chId: f.chId,
+                ext: aesDecrypt(this.key, f.body.subarray(0, f.payloadOffset)).toString(),
+                body: aesDecrypt(this.key, f.body.subarray(f.payloadOffset)).toString(),
+            });
+            return this.reply(s, f, this.refuseCommands ? st(400) : ok);
+        }
         this.reply(s, f, st(400));
     }
 }

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { Socket, connect as netConnect } from 'node:net';
-import { ChId, Cmd, DEFAULT_PORT, MsgClass, Status } from './constants';
+import { ChId, Cmd, DEFAULT_PORT, MsgClass, Status, XML_DECL } from './constants';
 import { aesDecrypt, aesEncrypt, bcXor, deriveAesKey, loginHashes } from './crypto';
 import { encodeFrame, Frame, FrameDecoder, messagePart } from './frame';
 import { buildBody, childText, findFirst, parseXml } from './xml';
@@ -166,7 +166,7 @@ export class BaichuanConnection extends EventEmitter {
     }
 
     /** Sends a frame and waits for the reply with the same cmd and message id. */
-    request(cmd: number, opts: { chId?: number; body?: Buffer; cls?: string; timeoutMs?: number } = {}): Promise<Reply> {
+    request(cmd: number, opts: { chId?: number; body?: Buffer; payloadOffset?: number; cls?: string; timeoutMs?: number } = {}): Promise<Reply> {
         return new Promise((resolve, reject) => {
             if (this.closed) return reject(new ClosedError('connection closed'));
             const msgId = this.nextMsgId();
@@ -179,7 +179,7 @@ export class BaichuanConnection extends EventEmitter {
             };
             this.pending.add(p);
             try {
-                this.write(encodeFrame({ cmd, chId: opts.chId ?? ChId.Host, msgId, cls: opts.cls, body: opts.body }));
+                this.write(encodeFrame({ cmd, chId: opts.chId ?? ChId.Host, msgId, cls: opts.cls, body: opts.body, payloadOffset: opts.payloadOffset }));
             }
             catch (e) {
                 this.pending.delete(p);
@@ -187,6 +187,16 @@ export class BaichuanConnection extends EventEmitter {
                 reject(e);
             }
         });
+    }
+
+    /**
+     * A command for one NVR channel, framed as reolink_aio does: a channel Extension, then the body, each AES-encrypted
+     * on its own, with the payload offset pointing past the extension.
+     */
+    channelCommand(cmd: number, channel: number, xml: string, timeoutMs?: number): Promise<Reply> {
+        const ext = this.aes(`${XML_DECL}\n<Extension version="1.1">\n<channelId>${channel}</channelId>\n</Extension>\n`);
+        const body = this.aes(xml);
+        return this.request(cmd, { chId: channel + 1, body: Buffer.concat([ext, body]), payloadOffset: ext.length, timeoutMs });
     }
 
     /** Encrypts an XML body with the session's AES key (after login). */

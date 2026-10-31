@@ -1,7 +1,9 @@
 import sdk, { DeviceProvider, Online, ScryptedDeviceBase, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { BaichuanClient } from './baichuan/client';
-import { formatEvent, PushEvent } from './baichuan/events';
+import { Cmd } from './baichuan/constants';
+import { formatEvent, parseFloodlightStatus, PushEvent } from './baichuan/events';
+import { Frame } from './baichuan/frame';
 import { ReolinkChannelCamera } from './camera';
 import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops, parseMirrors } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
@@ -79,6 +81,15 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         push.on('warn', e => this.console.warn(`push: ${e.message}`));
         push.on('login', d => this.console.log(`push login ok, ${d.channelNum ?? '?'} channels`));
         push.on('event', ev => this.onPush(ev));
+        push.on('push', (f: Frame, xml: string) => {
+            if (f.cmd !== Cmd.FloodlightStatus) return;
+            try {
+                for (const s of parseFloodlightStatus(xml)) this.cameras.get(cameraNativeId(this.nativeId!, s.channel))?.floodlightState(s.on);
+            }
+            catch (e) {
+                this.console.warn(`floodlight status: ${(e as Error).message}`);
+            }
+        });
         push.start();
         if (!this.storageSettings.values.channels?.length)
             this.discover().catch(e => this.console.warn(`discovery failed: ${e.message}`));
@@ -101,6 +112,12 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         this.lastEventAt = Date.now();
         if (this.storageSettings.values.logEvents) this.console.log(formatEvent(ev));
         this.cameras.get(cameraNativeId(this.nativeId!, ev.channel))?.onPush(ev);
+    }
+
+    /** The live Baichuan session, for commands; throws while there is none. */
+    pushClient(): BaichuanClient {
+        if (!this.push) throw new Error('NVR not configured');
+        return this.push;
     }
 
     channelCache(channel: number): ChannelCache | undefined {

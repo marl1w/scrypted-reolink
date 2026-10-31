@@ -1,3 +1,4 @@
+import { XML_DECL } from './constants';
 import { childText, findFirst, parseXml, XmlNode } from './xml';
 
 /** AI classes reported in AItype. Unknown classes are passed through as strings. */
@@ -81,4 +82,29 @@ export function formatEvent(e: PushEvent): string {
     const ai = [...e.ai].join(',') || 'none';
     const extra = e.status.filter(s => s !== 'MD');
     return `ch${e.channel} motion=${e.motion ? 1 : 0} ai=${ai}${extra.length ? ` status=${extra.join(',')}` : ''}`;
+}
+
+/** Floodlight state pushes (cmd 291): one entry per channel listed, as reolink_aio reads them. */
+export function parseFloodlightStatus(xml: string | XmlNode): { channel: number; on: boolean }[] {
+    const root = typeof xml === 'string' ? parseXml(xml) : xml;
+    const out: { channel: number; on: boolean }[] = [];
+    const visit = (n: XmlNode) => {
+        const ch = childText(n, 'channel'), st = childText(n, 'status');
+        if (ch !== undefined && st !== undefined && /^\d+$/.test(ch) && /^\d+$/.test(st)) out.push({ channel: parseInt(ch, 10), on: st !== '0' });
+        else n.children.forEach(visit);
+    };
+    visit(root);
+    return out;
+}
+
+/** The body of a manual floodlight switch (cmd 288); the device keeps it on at most `duration` seconds. */
+export function floodlightXml(channel: number, on: boolean, duration = 180): string {
+    return `${XML_DECL}\n<body>\n<FloodlightManual version="1.1">\n<channelId>${channel}</channelId>\n<status>${on ? 1 : 0}</status>\n<duration>${duration}</duration>\n</FloodlightManual>\n</body>`;
+}
+
+/** The body of a siren command (cmd 263): manual on/off, or `times` plays. */
+export function sirenXml(channel: number, on: boolean, times?: number): string {
+    const mode = times !== undefined ? `<playMode>0</playMode>\n<playDuration>10</playDuration>\n<playTimes>${times}</playTimes>\n<onOff>1</onOff>`
+        : `<playMode>2</playMode>\n<playDuration>10</playDuration>\n<playTimes>1</playTimes>\n<onOff>${on ? 1 : 0}</onOff>`;
+    return `${XML_DECL}\n<body>\n<audioPlayInfo version="1.1">\n<channelId>${channel}</channelId>\n${mode}\n</audioPlayInfo>\n</body>`;
 }

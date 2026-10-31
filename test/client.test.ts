@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BaichuanClient, ClientOptions } from '../src/baichuan/client';
-import { PushEvent } from '../src/baichuan/events';
+import { floodlightXml, PushEvent, sirenXml } from '../src/baichuan/events';
 import { fixture, MockNvr } from './mock-nvr';
 
 const until = async (cond: () => boolean, ms = 3000) => {
@@ -81,3 +81,23 @@ test('periodic re-subscribe', () => withNvr(async (n, mk) => {
     c.start();
     await until(() => n.log.filter(l => l === 'cmd31').length >= 3);
 }));
+
+test('channel commands carry the channel extension and the body, each encrypted, on channel+1', () => withNvr(async (n, mk) => {
+    const c = mk();
+    c.start();
+    await until(() => c.stats.state === 'subscribed');
+    await c.channelCommand(288, 3, floodlightXml(3, true));
+    await c.channelCommand(263, 3, sirenXml(3, false));
+    assert.equal(n.commands.length, 2);
+    assert.equal(n.commands[0].chId, 4);
+    assert.match(n.commands[0].ext, /<Extension version="1.1">\s*<channelId>3<\/channelId>/);
+    assert.match(n.commands[0].body, /<FloodlightManual version="1.1">\s*<channelId>3<\/channelId>\s*<status>1<\/status>/);
+    assert.match(n.commands[1].body, /<playMode>2<\/playMode>[\s\S]*<onOff>0<\/onOff>/);
+    n.refuseCommands = true;
+    await assert.rejects(c.channelCommand(288, 3, floodlightXml(3, false)));
+}));
+
+test('channel commands are refused while not subscribed', async () => {
+    const c = new BaichuanClient({ host: '127.0.0.1', port: 1, username: 'u', password: 'p' });
+    await assert.rejects(c.channelCommand(288, 0, floodlightXml(0, true)), /not connected/);
+});

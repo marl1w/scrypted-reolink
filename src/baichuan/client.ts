@@ -212,6 +212,13 @@ export class BaichuanClient extends EventEmitter<BaichuanClientEvents> {
         }
     }
 
+    /** A command for one channel on the live session; rejects while not subscribed. */
+    async channelCommand(cmd: number, channel: number, xml: string): Promise<void> {
+        const c = this.conn;
+        if (!c || c.isClosed || this.stats.state !== 'subscribed') throw new Error('Baichuan session not connected');
+        await c.channelCommand(cmd, channel, xml);
+    }
+
     private onPush(f: Frame, xml: string) {
         if (f.cmd !== Cmd.AlarmEvent) {
             this.emit('push', f, xml);

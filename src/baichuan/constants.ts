@@ -11,6 +11,9 @@ export const Cmd = {
     AlarmUnsubscribe: 32,
     AlarmEvent: 33,
     LinkType: 93, // used as keep-alive, as reolink_aio does
+    AudioAlarmPlay: 263, // siren, as reolink_aio's AudioAlarmPlay
+    FloodlightManual: 288, // floodlight on/off, as reolink_aio's set_floodlight
+    FloodlightStatus: 291, // push: floodlight state per channel
     UdpHeartbeat: 234,
 } as const;
 
