@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handleMediaRequest, linkExpiry, mediaLink, MediaHost } from '../src/media-http';
+import { clipBuffers, handleMediaRequest, linkExpiry, mediaLink, MediaHost } from '../src/media-http';
 
 const KEY = Buffer.alloc(32, 3);
 const NOW = Date.parse('2026-10-31T12:20:00Z');
@@ -58,23 +58,86 @@ test('a thumbnail link serves the JPEG; a forged, expired or foreign one is refu
     assert.equal(calls.length, 1);
 });
 
+async function drain(s: AsyncGenerator<Buffer, void>) {
+    const out: Buffer[] = [];
+    for await (const b of s) out.push(b);
+    return Buffer.concat(out).toString();
+}
+
+function reset() {
+    for (const b of clipBuffers.values()) b.stop();
+    clipBuffers.clear();
+}
+
 test('a clip link streams video/mp4; a busy NVR is a 503; range probes do not open the NVR', async () => {
+    reset();
     const calls: string[] = [];
-    const ok = await get(link('clip'), host(calls), { range: 'bytes=0-' });
-    assert.equal(ok.res.code, 200);
-    assert.equal(ok.res.headers['Content-Type'], 'video/mp4');
-    const chunks: string[] = [];
-    for await (const b of ok.res.stream!) chunks.push(b.toString());
-    assert.deepEqual(chunks, ['ftyp']);
     const probe = await get(link('clip'), host(calls), { range: 'bytes=0-1' });
     assert.equal(probe.res.code, 206);
     assert.deepEqual(probe.res.body, Buffer.alloc(2));
-    assert.equal((await get(link('clip'), host(calls), { range: 'bytes=500-' })).res.code, 416);
+    assert.equal((await get(link('clip'), host(calls), { range: 'bytes=500-' })).res.code, 416, 'nothing to resume');
     assert.equal((await get(link('clip'), host(calls), {}, 'HEAD')).res.code, 200);
-    assert.deepEqual(calls, ['clip 2 CLIP'], 'only the real request opened the NVR');
+    assert.deepEqual(calls, [], 'probes did not open the NVR');
+    const ok = await get(link('clip'), host(calls), { range: 'bytes=0-' });
+    assert.equal(ok.res.code, 200);
+    assert.equal(ok.res.headers['Content-Type'], 'video/mp4');
+    assert.equal(await drain(ok.res.stream!), 'ftyp');
+    assert.deepEqual(calls, ['clip 2 CLIP']);
+    reset();
     const busy = await get(link('clip'), host(calls, { clipMp4: async () => { throw new Error('NVR playback busy: 3 playback streams or thumbnails already open'); } }));
     assert.equal(busy.res.code, 503);
     const failed = await get(link('clip'), host(calls, { clipMp4: async () => { throw new Error('clip failed: http://192.0.2.10/x?token=abc'); } }));
     assert.equal(failed.res.code, 502);
     assert.ok(!String(failed.res.body).includes('abc'), 'scrubbed');
+    reset();
+});
+
+test('a dropped clip connection resumes from its kept bytes; a finished clip serves any range with its length', async () => {
+    reset();
+    const calls: string[] = [];
+    let push!: (b?: Buffer) => void;
+    const queue: (Buffer | undefined)[] = [];
+    let wait: (() => void) | undefined;
+    push = b => { queue.push(b); wait?.(); };
+    const h = host(calls, {
+        clipMp4: async () => {
+            calls.push('open');
+            return {
+                stream: (async function* () {
+                    while (true) {
+                        while (!queue.length) await new Promise<void>(r => wait = r);
+                        const b = queue.shift();
+                        if (!b) return;
+                        yield b;
+                    }
+                })(), stop() { calls.push('stop'); },
+            };
+        },
+    });
+    push(Buffer.from('0123'));
+    const first = await get(link('clip'), h, { range: 'bytes=0-' });
+    const it = first.res.stream!;
+    assert.equal((await it.next()).value!.toString(), '0123');
+    await it.return(undefined); // the browser dropped the connection
+    push(Buffer.from('4567'));
+    await new Promise(r => setImmediate(r));
+    const resumed = await get(link('clip'), h, { range: 'bytes=2-' });
+    assert.equal(resumed.res.code, 206);
+    assert.match(resumed.res.headers['Content-Range'], /^bytes 2-\d+\/\*$/);
+    const rest = drain(resumed.res.stream!);
+    push(Buffer.from('89'));
+    push(undefined);
+    assert.equal(await rest, '23456789');
+    assert.deepEqual(calls, ['open', 'stop'], 'one remux for both requests');
+    const range = await get(link('clip'), h, { range: 'bytes=3-5' });
+    assert.equal(range.res.code, 206);
+    assert.equal(range.res.headers['Content-Range'], 'bytes 3-5/10');
+    assert.equal(range.res.headers['Content-Length'], '3');
+    assert.equal(await drain(range.res.stream!), '345');
+    const whole = await get(link('clip'), h);
+    assert.equal(whole.res.code, 200);
+    assert.equal(whole.res.headers['Content-Length'], '10');
+    assert.equal(await drain(whole.res.stream!), '0123456789');
+    assert.equal((await get(link('clip'), h, { range: 'bytes=10-' })).res.code, 416);
+    reset();
 });
