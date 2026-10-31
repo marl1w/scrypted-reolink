@@ -52,3 +52,22 @@ test('no keyframe in time resolves undefined so the caller can fall back', async
     c.stop();
     assert.equal(await c.keyframe(300, 30), undefined);
 });
+
+test('a delayed start reads the source after the delay; restart reads it again at once', async () => {
+    let reads = 0;
+    const c = new KeyframeCache({ ffmpegPath: async () => 'ffmpeg', source: async () => { reads++; throw new Error('none'); }, log: () => { }, restartMinMs: 1e6 });
+    const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
+    c.start(50);
+    await wait(10);
+    assert.equal(reads, 0);
+    await wait(80);
+    assert.equal(reads, 1);
+    c.restart();
+    await wait(10);
+    assert.equal(reads, 2);
+    c.stop();
+    c.restart();
+    await wait(10);
+    assert.equal(reads, 2);
+    assert.equal(c.running, false);
+});

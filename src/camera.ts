@@ -7,11 +7,18 @@ import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
 import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, parseCrops, parseMirrors, parseViewCrop } from './devices';
-import { addStreamCredentials, buildStreamOptions, StreamOption } from './streams';
+import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 
 const SNAPSHOT_REUSE_MS = 300;
 const SNAPSHOT_WAIT_MS = 1500;
+/** The keyframe cache retries Rebroadcast after reading the NVR for this long, doubling up to the max. */
+const REBROADCAST_RETRY_MS = 60_000;
+const REBROADCAST_RETRY_MAX_MS = 600_000;
+/** Caches start within this spread, not all at once (one NVR, many channels). */
+const CACHE_START_SPREAD_MS = 5000;
+/** A repeated warning (substream not prebuffered, cache reading the NVR) is logged at most this often. */
+const WARN_EVERY_MS = 600_000;
 
 export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCamera, Camera, MotionSensor, ObjectDetector, Settings, Online, DeviceProvider {
     storageSettings = new StorageSettings(this, {
@@ -101,7 +108,18 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
                 return v && `crop=${v.width}:${v.height}:${v.x}:${v.y}`;
             },
         });
-        if (this.storageSettings.values.snapshotCache) this.snapshots.start();
+        if (this.storageSettings.values.snapshotCache) this.snapshots.start(Math.random() * CACHE_START_SPREAD_MS);
+        this.watchSettings();
+    }
+
+    private warnedAt = new Map<string, number>();
+
+    /** A warning logged at most every WARN_EVERY_MS per key. */
+    private warnEvery(key: string, msg: string) {
+        const now = Date.now();
+        if (now - (this.warnedAt.get(key) ?? -Infinity) < WARN_EVERY_MS) return;
+        this.warnedAt.set(key, now);
+        this.console.warn(msg);
     }
 
     viewCrop() {
@@ -155,41 +173,119 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
      */
     async readSubstream(options: RequestMediaStreamOptions | undefined, opts: ResponseMediaStreamOptions): Promise<MediaObject> {
         const self = sdk.systemManager.getDeviceById<VideoCamera>(this.id);
-        const mo = await self.getVideoStream({ ...options, id: this.snapshotStream().id, destination: 'local' } as RequestMediaStreamOptions);
+        const mo = await self.getVideoStream({ ...options, id: (await this.substream(true)).id, destination: 'local' } as RequestMediaStreamOptions);
         const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
         return sdk.mediaManager.createFFmpegMediaObject({ ...ff, mediaStreamOptions: { ...ff.mediaStreamOptions, ...opts } });
     }
 
     /** The lowest-resolution RTSP stream: keyframes are cheap to decode and match what HomeKit shows. */
     snapshotStream(): StreamOption {
-        const rtsp = this.streams().filter(s => s.container === 'rtsp' && s.url);
-        rtsp.sort((a, b) => (a.video?.width ?? 1e9) - (b.video?.width ?? 1e9));
-        const s = rtsp.find(x => x.id.endsWith(`_${String(this.channel + 1).padStart(2, '0')}_sub`)) ?? rtsp[0];
+        const s = rtspSubstream(this.streams(), this.channel);
         if (!s) throw new Error('no RTSP stream');
         return s;
     }
 
+    /** Names and ids of the streams Rebroadcast prebuffers; cached until this device's settings change. */
+    private prebuffered?: Promise<string[]>;
+    private settingsListener?: EventListenerRegister;
+    private settingsTimer?: NodeJS.Timeout;
+
+    private prebufferedNames(): Promise<string[]> {
+        this.watchSettings();
+        if (!this.prebuffered) {
+            const dev = sdk.systemManager.getDeviceById<PrebufferView>(this.id);
+            let timer: NodeJS.Timeout | undefined;
+            const p = Promise.race([
+                prebufferedStreams(dev),
+                new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 5000); }),
+            ]).finally(() => clearTimeout(timer));
+            this.prebuffered = p;
+            p.catch(e => {
+                if (this.prebuffered === p) this.prebuffered = undefined;
+                this.warnEvery('prebuffered', `Rebroadcast settings unreadable (${(e as Error).message})`);
+            });
+        }
+        return this.prebuffered.catch(() => []);
+    }
+
+    /**
+     * Rebroadcast's settings live on this device (its mixins): a change there, or here, may change the substream it
+     * prebuffers, and then the keyframe cache reads the new one.
+     */
+    private watchSettings() {
+        if (this.settingsListener || !this.id) return;
+        this.settingsListener = sdk.systemManager.listenDevice(this.id, ScryptedInterface.Settings, () => {
+            this.prebuffered = undefined;
+            // one change puts several settings: act once they have settled
+            clearTimeout(this.settingsTimer);
+            this.settingsTimer = setTimeout(() => this.followSubstream().catch(e => this.console.warn(`substream: ${(e as Error).message}`)), 2000);
+        });
+    }
+
+    /** The cache's stream when it last started; restarted when the substream to read is another one. */
+    private cacheStreamId?: string;
+
+    /** The substream may have changed (Rebroadcast settings, Substream Protocol): a running cache reads it again. */
+    async followSubstream(force = false) {
+        this.prebuffered = undefined;
+        if (!this.snapshots.running) return;
+        const id = (await this.substream()).id;
+        // a cache that has not read yet picks the current substream when it does
+        if (!force && (this.cacheStreamId === undefined || id === this.cacheStreamId)) return;
+        this.console.log(`snapshot cache: substream ${this.cacheStreamId ?? '?'} -> ${id}, restarting`);
+        this.snapshots.restart();
+    }
+
+    /**
+     * The substream Rebroadcast prebuffers (sub.bcs or h264Preview_NN_sub), read through it so no NVR connection is
+     * added; the NVR's Substream Protocol breaks a tie and picks when Rebroadcast prebuffers neither. A reader
+     * starting asks with fresh (rare, and a settings event may not reach this device for every mixin).
+     */
+    async substream(fresh = false): Promise<StreamOption> {
+        if (fresh) this.prebuffered = undefined;
+        const c = chooseSubstream(this.streams(), this.channel, await this.prebufferedNames(), this.nvr.substreamProtocol, !!this.nvr.channelCache(this.channel));
+        if (!c.stream) throw new Error('no substream');
+        if (!c.prebuffered)
+            this.warnEvery(`substream:${c.stream.id}`, `substream ${c.stream.name} is not prebuffered by Rebroadcast: each reader (keyframe cache, View, crops) opens another NVR connection. Add it to the Rebroadcast Prebuffered Streams of this camera.`);
+        return c.stream;
+    }
+
+    /** Rebroadcast failures in a row: the retry of a fallback to the NVR grows with them. */
+    private rebroadcastFailures = 0;
+
     /**
      * Prefer Scrypted's local rebroadcast of the substream (the prebuffer already holds the one NVR connection),
-     * asked for through the device's mixins; fall back to the NVR itself and retry the rebroadcast later.
+     * asked for through the device's mixins; fall back to the NVR's RTSP substream and retry the rebroadcast later.
      */
     private async snapshotSource(): Promise<{ url: string; label: string; retryMs?: number }> {
         const s = this.snapshotStream();
+        let reason: string;
+        let timer: NodeJS.Timeout | undefined;
         try {
+            const sub = await this.substream(true);
+            this.cacheStreamId = sub.id;
             const dev = sdk.systemManager.getDeviceById<VideoCamera>(this.id);
             const mo = await Promise.race([
-                dev.getVideoStream({ id: s.id, prebuffer: 0, destination: 'local' } as RequestMediaStreamOptions),
-                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+                dev.getVideoStream({ id: sub.id, prebuffer: 0, destination: 'local' } as RequestMediaStreamOptions),
+                new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 10000); }),
             ]);
             const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
             const url = String(ff?.url || '');
-            if (/^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(url))
+            if (/^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(url)) {
+                this.rebroadcastFailures = 0;
                 return { url, label: 'rebroadcast' };
+            }
+            reason = `not a local rebroadcast: ${redactUrl(url)}`;
         }
         catch (e) {
-            this.console.warn(`snapshot cache: rebroadcast unavailable (${(e as Error).message}), reading the NVR`);
+            reason = (e as Error).message.replace(/\b[a-z]+:\/\/\S+/gi, redactUrl);
         }
-        return { url: addStreamCredentials(s.url, this.nvr.username, this.nvr.password), label: 'nvr', retryMs: 60000 };
+        finally {
+            clearTimeout(timer);
+        }
+        const retryMs = Math.min(REBROADCAST_RETRY_MS * 2 ** this.rebroadcastFailures++, REBROADCAST_RETRY_MAX_MS);
+        this.warnEvery('snapshot-fallback', `snapshot cache: rebroadcast unavailable (${reason}), reading the NVR (${s.id}), next try in ${retryMs / 1000} s`);
+        return { url: addStreamCredentials(s.url, this.nvr.username, this.nvr.password), label: 'nvr', retryMs };
     }
 
     onPush(ev: PushEvent) {
@@ -286,6 +382,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         for (const d of this.children.values()) (d as ReolinkMirrorCamera).dispose?.();
         this.motion.dispose();
         this.snapshots.stop();
+        clearTimeout(this.settingsTimer);
+        this.settingsListener?.removeListener();
+        this.settingsListener = undefined;
     }
 }
 

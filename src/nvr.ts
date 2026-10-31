@@ -8,6 +8,7 @@ import { ReolinkChannelCamera } from './camera';
 import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops, parseMirrors } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
+import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
 
@@ -24,6 +25,14 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         baichuanPort: { title: 'Baichuan Port', type: 'number', defaultValue: 9000, subgroup: 'Advanced', onPut: () => this.restart() },
         rtspPort: { title: 'RTSP Port', type: 'number', defaultValue: 554, subgroup: 'Advanced' },
         rtmpPort: { title: 'RTMP Port', type: 'number', defaultValue: 1935, subgroup: 'Advanced' },
+        substreamProtocol: {
+            title: 'Substream Protocol',
+            description: 'The substream the cameras read through Rebroadcast (keyframe cache, View, crops) when Rebroadcast prebuffers neither or both of RTSP h264Preview_NN_sub and RTMP sub.bcs; otherwise they follow the one it prebuffers. RTMP has evenly timed audio; the NVR\'s RTSP stamps audio frames with their send time, which stutters wherever the audio is re-timed or transcoded.',
+            choices: [...SUBSTREAM_PROTOCOLS],
+            defaultValue: 'RTSP',
+            subgroup: 'Advanced',
+            onPut: () => this.followSubstreams(),
+        },
         channels: {
             title: 'Channels',
             description: 'Channel numbers (0-based) to expose as cameras. Filled by discovery; add numbers by hand if a channel is missing.',
@@ -56,6 +65,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     get password() { return String(this.storageSettings.values.password || ''); }
     get rtspPort() { return Number(this.storageSettings.values.rtspPort) || 554; }
     get rtmpPort() { return Number(this.storageSettings.values.rtmpPort) || 1935; }
+    get substreamProtocol(): SubstreamProtocol { return parseSubstreamProtocol(this.storageSettings.values.substreamProtocol); }
 
     get api(): NvrApi {
         if (!this._api) throw new Error('NVR not configured');
@@ -177,6 +187,12 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: m.nativeId, devices: mirrors.children.filter(c => c.providerNativeId === m.nativeId) as any });
         }
         this.updateCameraOnline();
+    }
+
+    /** The Substream Protocol changed: running keyframe caches read the substream again. */
+    private followSubstreams() {
+        for (const c of this.cameras.values())
+            c.followSubstream(true).catch(e => c.console.warn(`substream: ${(e as Error).message}`));
     }
 
     private updateCameraOnline() {

@@ -100,6 +100,101 @@ export function buildStreamOptions(i: StreamInputs): StreamOption[] {
     return streams;
 }
 
+export const SUBSTREAM_PROTOCOLS = ['RTSP', 'RTMP'] as const;
+export type SubstreamProtocol = typeof SUBSTREAM_PROTOCOLS[number];
+
+/** The stored Substream Protocol: RTMP only when set so, anything else (unset, unknown) is RTSP. */
+export function parseSubstreamProtocol(v: unknown): SubstreamProtocol {
+    return v === 'RTMP' ? 'RTMP' : 'RTSP';
+}
+
+/** The channel's lowest-resolution RTSP stream, its `_sub` when present. */
+export function rtspSubstream(streams: StreamOption[], channel: number): StreamOption | undefined {
+    const rtsp = streams.filter(s => s.container === 'rtsp' && s.url);
+    rtsp.sort((a, b) => (a.video?.width ?? 1e9) - (b.video?.width ?? 1e9));
+    return rtsp.find(x => x.id.endsWith(`_${String(channel + 1).padStart(2, '0')}_sub`)) ?? rtsp[0];
+}
+
+/**
+ * The substream over the chosen protocol: the stream the Rebroadcast prebuffer is expected to hold, so the
+ * plugin's own readers (keyframe cache, View, crops) ask for that one and add no NVR connection.
+ *
+ * The same H.264 + AAC encoder output either way, but the NVR's RTSP server stamps each AAC frame with the time it
+ * sends it, not with its sample count: 1024-sample frames arrive 0 to 170 ms apart and carry those times, and
+ * any consumer that re-times or transcodes the audio (go2rtc's Opus for WebRTC, HomeKit) plays the overlaps and
+ * holes as stutter. RTMP (`sub.bcs`) carries exact 64 ms steps. Without an RTMP substream (Home Hub) RTSP is used,
+ * and so it is while the channel type is unknown (typeKnown false: not discovered yet, it may be a Home Hub).
+ */
+export function substreamOption(streams: StreamOption[], channel: number, protocol: SubstreamProtocol = 'RTSP', typeKnown = true): StreamOption | undefined {
+    if (protocol === 'RTMP' && typeKnown) {
+        const rtmp = streams.find(s => s.id === 'sub.bcs' && s.url);
+        if (rtmp) return rtmp;
+    }
+    return rtspSubstream(streams, channel);
+}
+
+/** Rebroadcast's camera settings (seen through the camera's mixins) whose values are stream names. */
+const PREBUFFER_ENABLED = 'prebuffer:enabledStreams';
+const PREBUFFER_ROLES = ['prebuffer:defaultStream', 'prebuffer:lowResolutionStream'];
+
+/** The camera as its mixins show it: Rebroadcast adds its settings and marks the streams it prebuffers. */
+export interface PrebufferView {
+    getSettings?(): Promise<{ key?: string; value?: unknown }[]>;
+    getVideoStreamOptions?(): Promise<{ id?: string; name?: string; prebuffer?: number }[]>;
+}
+
+/**
+ * Names and ids of the streams Rebroadcast prebuffers: its Prebuffered Streams (`prebuffer:enabledStreams`,
+ * stream names such as `RTMP sub.bcs`), else the streams of the default and low-resolution roles, plus any
+ * stream option it marks with a prebuffer time. Empty without Rebroadcast.
+ */
+export async function prebufferedStreams(dev: PrebufferView): Promise<string[]> {
+    const [settings, options] = await Promise.all([
+        dev.getSettings?.().catch(() => undefined),
+        dev.getVideoStreamOptions?.().catch(() => undefined),
+    ]);
+    const get = (key: string) => settings?.find(s => s.key === key)?.value;
+    const list = (v: unknown): string[] => {
+        if (typeof v === 'string' && v.startsWith('[')) {
+            try { v = JSON.parse(v); }
+            catch { return []; }
+        }
+        return (Array.isArray(v) ? v : [v]).filter((x): x is string => typeof x === 'string' && !!x);
+    };
+    let names = list(get(PREBUFFER_ENABLED));
+    if (!names.length) names = PREBUFFER_ROLES.flatMap(k => list(get(k)));
+    for (const o of options ?? [])
+        if ((o.prebuffer ?? 0) > 0) names.push(...[o.id, o.name].filter((x): x is string => !!x));
+    return [...new Set(names)];
+}
+
+export interface SubstreamChoice {
+    stream?: StreamOption;
+    /** Rebroadcast prebuffers it: reading it adds no NVR connection. */
+    prebuffered: boolean;
+}
+
+/**
+ * The substream Rebroadcast prebuffers (RTMP `sub.bcs` or the RTSP `_sub`), so the plugin's readers follow
+ * Rebroadcast rather than a setting that may not match it. The protocol breaks a tie and picks when Rebroadcast
+ * prebuffers neither (then each reader costs an NVR connection, and prebuffered is false).
+ */
+export function chooseSubstream(streams: StreamOption[], channel: number, prebuffered: string[], protocol: SubstreamProtocol = 'RTSP', typeKnown = true): SubstreamChoice {
+    const listed = (s?: StreamOption): s is StreamOption => !!s && (prebuffered.includes(s.id) || prebuffered.includes(s.name));
+    const found = [streams.find(s => s.id === 'sub.bcs' && s.url), rtspSubstream(streams, channel)].filter(listed);
+    if (found.length === 1) return { stream: found[0], prebuffered: true };
+    return { stream: substreamOption(streams, channel, protocol, typeKnown), prebuffered: found.length > 1 };
+}
+
+/** A stream URL for a log line: scheme, host and path only (RTSP userinfo and RTMP query credentials dropped). */
+export function redactUrl(url: string): string {
+    try {
+        const u = new URL(url);
+        return `${u.protocol}//${u.host}${u.pathname}`;
+    }
+    catch { return '(unparseable URL)'; }
+}
+
 /** Credentials as the stock plugin adds them when a stream is opened. */
 export function addStreamCredentials(url: string, username: string, password: string): string {
     const u = new URL(url);

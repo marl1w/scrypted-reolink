@@ -141,10 +141,19 @@ export class KeyframeCache {
 
     private now() { return (this.o.now ?? Date.now)(); }
 
-    start() {
+    /** delayMs puts off the first read (spreads the caches of one NVR when the plugin starts). */
+    start(delayMs = 0) {
         if (!this.stopped) return;
         this.stopped = false;
-        void this.spawn();
+        if (delayMs > 0) this.restartTimer = setTimeout(() => void this.spawn(), delayMs);
+        else void this.spawn();
+    }
+
+    /** Reads the source again now (it may have changed), if running. */
+    restart() {
+        if (this.stopped) return;
+        this.stop();
+        this.start();
     }
 
     stop() {
