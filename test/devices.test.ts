@@ -11,7 +11,7 @@ test('camera native ids are scoped per NVR and round-trip', () => {
 });
 
 test('camera device manifest', () => {
-    const cache = channelCacheFrom(2, { model: 'NVR-TEST', exactType: 'NVR' }, { channel: 2, name: 'Cam B', online: 1 }, { chnTypeInfo: { typeInfo: 'CAM-TEST', firmVer: 'v1' } }, ability, ['people']);
+    const cache = channelCacheFrom(2, { model: 'NVR-TEST', exactType: 'NVR' }, { channel: 2, name: 'Cam B', online: 1, uid: '95270000TESTUID' }, { chnTypeInfo: { typeInfo: 'CAM-TEST', firmVer: 'v1' } }, ability, ['people']);
     const d = buildCameraDevice('nvr-1', cache);
     assert.equal(d.nativeId, 'nvr-1-ch2');
     assert.equal(d.providerNativeId, 'nvr-1');
@@ -19,7 +19,9 @@ test('camera device manifest', () => {
     assert.equal(d.type, 'Camera');
     assert.deepEqual(d.interfaces, ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'Settings', 'Online', 'DeviceProvider']);
     assert.equal(d.info?.model, 'CAM-TEST');
+    assert.equal(d.info?.serialNumber, '95270000TESTUID');
     assert.equal(cache.exactType, 'NVR');
+    assert.equal(buildCameraDevice('nvr-1', { channel: 1 }).info?.serialNumber, undefined);
 });
 
 test('no siren/floodlight: no DeviceProvider, default name', () => {

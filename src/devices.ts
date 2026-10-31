@@ -28,6 +28,8 @@ export interface ChannelCache {
     online?: boolean;
     model?: string;
     firmware?: string;
+    /** the camera's UID as the NVR reports it, shown as its serial number (HomeKit: else "Default-SerialNumber") */
+    serialNumber?: string;
     exactType?: string;
     aiClasses?: string[];
     ability?: Ability;
@@ -58,7 +60,7 @@ export function buildCameraDevice(nvrNativeId: string, cache: ChannelCache, nvrN
         name: nvrName ? `${nvrName} ${channelName}` : channelName,
         type: 'Camera',
         interfaces: cameraInterfaces(cache),
-        info: { manufacturer: 'Reolink', model: cache.model, firmware: cache.firmware },
+        info: { manufacturer: 'Reolink', model: cache.model, firmware: cache.firmware, serialNumber: cache.serialNumber },
     };
 }
 
@@ -160,6 +162,7 @@ export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelS
         online: status ? status.online === 1 : undefined,
         model: details.chnTypeInfo?.typeInfo ?? status?.typeInfo ?? nvr.model,
         firmware: details.chnTypeInfo?.firmVer,
+        serialNumber: status?.uid || undefined,
         exactType: nvr.exactType,
         aiClasses,
         // Keep the shape abilityChn[channel] so the stock ability rules work unchanged.
