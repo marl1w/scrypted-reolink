@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<VersionInfo version="1.1">
+<channelId>1</channelId>
+<name>Garden</name>
+<type>B800</type>
+<serialNumber>141400000000001</serialNumber>
+<buildDay>build 2409132131</buildDay>
+<hardwareVersion>IPC_5158M8M_V2</hardwareVersion>
+<cfgVersion>v3.1.0.0</cfgVersion>
+<firmwareVersion>v3.1.0.4057_2409132131</firmwareVersion>
+<detail>IPC_5158M8M_V2S18E1W01100000000</detail>
+<IEClient>IEClient</IEClient>
+<pakSuffix>IPC_5158M8M_V2</pakSuffix>
+<helpVersion>blackPointsLevel=0</helpVersion>
+</VersionInfo>
+</body>

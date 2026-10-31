@@ -3,5 +3,6 @@ export * from './crypto';
 export * from './frame';
 export * from './xml';
 export * from './events';
+export * from './info';
 export * from './connection';
 export * from './client';

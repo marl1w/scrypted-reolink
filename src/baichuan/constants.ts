@@ -10,10 +10,14 @@ export const Cmd = {
     AlarmSubscribe: 31,
     AlarmUnsubscribe: 32,
     AlarmEvent: 33,
+    LocalLink: 76, // IP and MAC (verified; per channel the NVR answers with its own MAC)
+    HostVersionInfo: 80, // VersionInfo of the device itself (verified)
     LinkType: 93, // used as keep-alive, as reolink_aio does
+    Uid: 114, // the device's UID (verified)
     AudioAlarmPlay: 263, // siren, as reolink_aio's AudioAlarmPlay
     FloodlightManual: 288, // floodlight on/off, as reolink_aio's set_floodlight
     FloodlightStatus: 291, // push: floodlight state per channel
+    VersionInfo: 318, // VersionInfo of one channel's camera, with its serial number (verified)
     UdpHeartbeat: 234,
 } as const;
 

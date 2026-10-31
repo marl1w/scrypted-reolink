@@ -3,14 +3,16 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { BaichuanClient } from './baichuan/client';
 import { Cmd } from './baichuan/constants';
 import { formatEvent, parseFloodlightStatus, PushEvent } from './baichuan/events';
+import { parseMac, parseUid, parseVersionInfo } from './baichuan/info';
 import { Frame } from './baichuan/frame';
 import { ReolinkChannelCamera } from './camera';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, ChannelCache, channelCacheFrom, formatHealth, parseCameraNativeId, parseCrops, parseMirrors } from './devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, cameraSerialNumber, ChannelCache, channelCacheFrom, distinctSerials, formatHealth, NvrIds, parseCameraNativeId, parseCrops, parseMirrors, realId } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
+const NVR_IDS = 'nvrIds';
 
 /**
  * One Reolink NVR: exactly one Baichuan push connection and at most one HTTP API session,
@@ -54,6 +56,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     push?: BaichuanClient;
     private cameras = new Map<string, ReolinkChannelCamera>();
     private lastEventAt?: number;
+    private identity?: Promise<boolean>;
+    private identityRead = false;
 
     constructor(nativeId: string) {
         super(nativeId);
@@ -87,6 +91,12 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             if (s !== 'subscribed') for (const c of this.cameras.values()) c.motion.reset();
             else for (const c of this.cameras.values()) c.rawSubscribed();
             this.updateCameraOnline();
+            // once per start: serials only change when a camera is replaced, and Discover reads them again
+            if (s === 'subscribed' && !this.identityRead) {
+                this.identityRead = true;
+                this.refreshIdentity().then(changed => { if (changed) return this.syncDevices(); })
+                    .catch(e => this.console.warn(`serial numbers: ${(e as Error).message}`));
+            }
         });
         push.on('warn', e => this.console.warn(`push: ${e.message}`));
         push.on('login', d => this.console.log(`push login ok, ${d.channelNum ?? '?'} channels`));
@@ -110,6 +120,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         this.push = undefined;
         this.session = undefined;
         this._api = undefined;
+        this.identityRead = false;
         await Promise.all([p?.stop(), s?.stop()]);
     }
 
@@ -142,6 +153,43 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         this.storage.setItem(CACHE_PREFIX + c.channel, JSON.stringify(c));
     }
 
+    private nvrIds(): NvrIds {
+        try { return JSON.parse(this.storage.getItem(NVR_IDS) || '{}'); }
+        catch { return {}; }
+    }
+
+    /** The NVR's UID and MAC and each camera's own serial, over Baichuan (no HTTP login), into the shown serials. */
+    refreshIdentity(): Promise<boolean> {
+        this.identity ??= this.readIdentity().finally(() => { this.identity = undefined; });
+        return this.identity;
+    }
+
+    private async readIdentity(): Promise<boolean> {
+        const push = this.pushClient();
+        const read = (cmd: number, channel?: number) => push.query(cmd, channel).catch(() => '');
+        const ids = this.nvrIds();
+        ids.uid = realId(parseUid(await read(Cmd.Uid))) ?? ids.uid;
+        ids.mac = realId(parseMac(await read(Cmd.LocalLink))) ?? ids.mac;
+        this.storage.setItem(NVR_IDS, JSON.stringify(ids));
+        const chans: number[] = (this.storageSettings.values.channels ?? []).map((x: any) => parseInt(String(x), 10)).filter((n: number) => !isNaN(n));
+        const seen = new Map<number, string | undefined>();
+        // an offline camera does not answer: it keeps the serial it reported last
+        for (const ch of chans)
+            seen.set(ch, realId(parseVersionInfo(await read(Cmd.VersionInfo, ch)).serialNumber) ?? this.channelCache(ch)?.cameraSerial);
+        const serials = distinctSerials(seen);
+        let changed = false;
+        for (const ch of chans) {
+            const cache = this.channelCache(ch);
+            if (!cache) continue;
+            // caches from 0.1.16 have no uid: their serial is the UID unless it is the "<NVR serial>-<n>" fallback
+            const uid = cache.uid ?? (cache.serialNumber?.includes('-') ? '' : cache.serialNumber ?? '');
+            const serialNumber = cameraSerialNumber(ch, { uid, cameraSerial: serials.get(ch), model: cache.model }, ids);
+            changed ||= serialNumber !== cache.serialNumber;
+            this.setChannelCache({ ...cache, uid, cameraSerial: serials.get(ch), serialNumber });
+        }
+        return changed;
+    }
+
     snapshot(channel: number, timeoutMs?: number) {
         if (!this.session) throw new Error('NVR not configured');
         return this.session.snapshot(channel, timeoutMs);
@@ -154,10 +202,13 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         const found = discoveredChannels(status);
         const manual: number[] = (this.storageSettings.values.channels ?? []).map((x: any) => parseInt(String(x), 10)).filter((n: number) => !isNaN(n));
         const all = [...new Set([...found.map(s => s.channel), ...manual])].sort((a, b) => a - b);
+        const nvrIds = { ...this.nvrIds(), serial: dev.serial };
+        this.storage.setItem(NVR_IDS, JSON.stringify(nvrIds));
         for (const ch of all) {
             try {
                 const d = await api.channelDetails(ch);
-                this.setChannelCache(channelCacheFrom(ch, dev, status.find(s => s.channel === ch), d, ability, supportedAiClasses(d.ai)));
+                const cameraSerial = this.channelCache(ch)?.cameraSerial;
+                this.setChannelCache(channelCacheFrom(ch, dev, status.find(s => s.channel === ch), { ...d, cameraSerial, nvrIds }, ability, supportedAiClasses(d.ai)));
             }
             catch (e) {
                 this.console.warn(`channel ${ch} details failed: ${(e as Error).message}`);
@@ -166,6 +217,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         this.console.log(`discovered channels: ${all.join(', ') || 'none'}`);
         for (const c of this.cameras.values()) c.rawRediscovered();
         this.storageSettings.values.channels = all.map(String);
+        if (this.push?.state === 'subscribed')
+            await this.refreshIdentity().catch(e => this.console.warn(`serial numbers: ${(e as Error).message}`));
         await this.syncDevices();
     }
 

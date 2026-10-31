@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, parseCrops, parseMirrors, parseViewCrop, cameraNativeId, channelCacheFrom, formatHealth, parseCameraNativeId } from '../src/devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, parseCrops, parseMirrors, parseViewCrop, cameraNativeId, cameraSerialNumber, channelCacheFrom, distinctSerials, formatHealth, parseCameraNativeId, realId, slugTag } from '../src/devices';
 
 const ability = { abilityChn: [{ supportAudioAlarm: { ver: 1 } }, {}, { floodLight: { ver: 1 } }] };
 
@@ -23,6 +23,28 @@ test('camera device manifest', () => {
     assert.equal(cache.exactType, 'NVR');
     assert.equal(buildCameraDevice('nvr-1', { channel: 1 }).info?.serialNumber, undefined);
     assert.equal(channelCacheFrom(4, { serial: 'NVRSERIAL' }, { channel: 4, online: 1 }, {}, ability, []).serialNumber, 'NVRSERIAL-5', 'no UID: the NVR serial and channel');
+    const noUid = channelCacheFrom(4, { serial: '00000000000000' }, { channel: 4, online: 1, uid: '' }, { cameraSerial: '141400000000001', nvrIds: { uid: '95270000EXAMPLE1' } }, ability, []);
+    assert.equal(noUid.serialNumber, '141400000000001', 'no UID: the camera serial from Baichuan');
+    assert.equal(noUid.uid, '', 'no UID is kept as empty, to tell it from a cache before 0.1.17');
+});
+
+test('serial number fallback order, all-zero values treated as missing', () => {
+    const nvr = { serial: '00000000000000', uid: '95270000EXAMPLE1', mac: '02:00:5e:10:00:01' };
+    assert.equal(cameraSerialNumber(1, { uid: '95270000CAMERA01', cameraSerial: '141400000000001' }, nvr), '95270000CAMERA01');
+    assert.equal(cameraSerialNumber(1, { uid: '', cameraSerial: '141400000000001' }, nvr), '141400000000001');
+    assert.equal(cameraSerialNumber(1, { cameraSerial: '000000000000000' }, nvr), '95270000EXAMPLE1-2');
+    assert.equal(cameraSerialNumber(1, {}, { serial: 'NVRSERIAL', uid: nvr.uid }), 'NVRSERIAL-2');
+    assert.equal(cameraSerialNumber(1, {}, { serial: nvr.serial, mac: nvr.mac }), '02005E100001-2');
+    assert.equal(cameraSerialNumber(1, { model: 'B800' }, { serial: nvr.serial, mac: '00:00:00:00:00:00' }), 'B800-2');
+    assert.equal(cameraSerialNumber(1, {}, { serial: nvr.serial }), undefined, 'never all zeros');
+    assert.equal(realId(' 0000 '), undefined);
+    assert.equal(realId('00:00:00:00:00:00'), undefined);
+    assert.equal(realId('0032'), '0032');
+});
+
+test('a serial two channels share is dropped', () => {
+    assert.deepEqual([...distinctSerials(new Map([[0, 'A1'], [1, 'DUP'], [2, undefined], [3, 'DUP']]))],
+        [[0, 'A1'], [1, undefined], [2, undefined], [3, undefined]]);
 });
 
 test('no siren/floodlight: no DeviceProvider, default name', () => {
@@ -74,4 +96,15 @@ test('mirror cameras follow a configured crop and get presence children', () => 
         ['nvr-1-ch8-mirror-home-a-drive-animal', 'nvr-1-ch8-mirror-home-a-drive', 'home_a_drive Animal Presence'],
     ]);
     assert.deepEqual(parseMirrors(undefined, crops), []);
+});
+
+test('crop and mirror serials: source serial and a short tag, no names', () => {
+    const crops = parseCrops(['Parking Spot=640:360:0:0']);
+    const [crop] = buildCropDevices('nvr-1-ch8', crops, '141400000000001');
+    assert.equal(crop.info?.serialNumber, `141400000000001-crop-${slugTag('parking-spot')}`);
+    assert.match(crop.info!.serialNumber!, /^141400000000001-crop-[0-9a-f]{6}$/);
+    const m = buildMirrorDevices('nvr-1-ch8', parseMirrors(['Home A Drive=Parking Spot'], crops), '141400000000001');
+    assert.match(m.mirrors[0].info!.serialNumber!, /^141400000000001-mirror-[0-9a-f]{6}$/);
+    assert.notEqual(slugTag('parking-spot'), slugTag('gate'));
+    assert.equal(buildCropDevices('nvr-1-ch8', crops).at(0)?.info?.serialNumber, undefined);
 });

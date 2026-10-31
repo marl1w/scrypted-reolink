@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BaichuanClient, ClientOptions } from '../src/baichuan/client';
 import { floodlightXml, PushEvent, sirenXml } from '../src/baichuan/events';
+import { parseUid, parseVersionInfo } from '../src/baichuan/info';
 import { fixture, MockNvr } from './mock-nvr';
 
 const until = async (cond: () => boolean, ms = 3000) => {
@@ -101,3 +102,16 @@ test('channel commands are refused while not subscribed', async () => {
     const c = new BaichuanClient({ host: '127.0.0.1', port: 1, username: 'u', password: 'p' });
     await assert.rejects(c.channelCommand(288, 0, floodlightXml(0, true)), /not connected/);
 });
+
+test('queries read the host or one channel and resolve to the reply XML', () => withNvr(async (n, mk) => {
+    const c = mk();
+    await assert.rejects(c.query(318, 1), /not connected/);
+    c.start();
+    await until(() => c.stats.state === 'subscribed');
+    assert.equal(parseUid(await c.query(114)), '95270000EXAMPLE1');
+    assert.equal(parseVersionInfo(await c.query(318, 1)).serialNumber, '141400000000001');
+    assert.equal(n.commands[0].chId, 2);
+    assert.match(n.commands[0].ext, /<channelId>1<\/channelId>/);
+    assert.equal(n.commands[0].body, '');
+    await assert.rejects(c.query(999));
+}));

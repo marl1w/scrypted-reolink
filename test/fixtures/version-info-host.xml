@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<VersionInfo version="1.1">
+<name>NVR</name>
+<type>RLN8-410</type>
+<serialNumber>00000000000000</serialNumber>
+<buildDay>build 26062933</buildDay>
+<hardwareVersion>N7MB01</hardwareVersion>
+<cfgVersion>v3.0.0.0</cfgVersion>
+<firmwareVersion>v3.6.5.562_26062933</firmwareVersion>
+<detail>NVR660800C1040010002</detail>
+<IEClient>IEClient</IEClient>
+<pakSuffix>pak</pakSuffix>
+<helpVersion>blackPointsLevel=0</helpVersion>
+</VersionInfo>
+</body>

@@ -1,5 +1,6 @@
 // Pure device manifests (no SDK runtime calls), so they can be unit tested.
 // Plain strings equal to the SDK enum values: this module must load without the Scrypted runtime.
+import { createHash } from 'node:crypto';
 import type { Ability, ChannelStatus, DevInfo } from './http/nvr-api';
 import { hasFloodlight, hasSiren } from './http/nvr-api';
 
@@ -28,8 +29,12 @@ export interface ChannelCache {
     online?: boolean;
     model?: string;
     firmware?: string;
-    /** the camera's UID as the NVR reports it, shown as its serial number (HomeKit: else "Default-SerialNumber") */
+    /** shown as the serial number (HomeKit: else "Default-SerialNumber"); see cameraSerialNumber */
     serialNumber?: string;
+    /** the camera's UID from GetChannelstatus, '' for none (some models, B800); absent in caches before 0.1.17 */
+    uid?: string;
+    /** the camera's own serial number, over Baichuan (cmd 318); kept once seen, an offline camera does not answer */
+    cameraSerial?: string;
     exactType?: string;
     aiClasses?: string[];
     ability?: Ability;
@@ -95,6 +100,9 @@ export function parseCrops(entries: unknown): CropSpec[] {
 
 export const cropNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-crop-${slug}`;
 
+/** A short stable tag for a crop or mirror serial: the slug embeds user-chosen names. */
+export const slugTag = (slug: string) => createHash('sha1').update(slug).digest('hex').slice(0, 6);
+
 export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[], serialNumber?: string): DeviceManifest[] {
     return crops.map(c => ({
         nativeId: cropNativeId(cameraNativeIdValue, c.slug),
@@ -102,7 +110,7 @@ export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[],
         name: c.name,
         type: 'Camera',
         interfaces: ['VideoCamera', 'Settings'],
-        info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-${c.slug}` },
+        info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-crop-${slugTag(c.slug)}` },
     }));
 }
 
@@ -147,7 +155,7 @@ export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorS
             name: m.name,
             type: 'Camera',
             interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector', 'Settings', 'DeviceProvider'],
-            info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-${m.slug}` },
+            info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-mirror-${slugTag(m.slug)}` },
         });
         // Named "<camera> Vehicle Presence" so the patched HomeKit plugin puts them inside the camera tile.
         for (const g of MIRROR_PRESENCE)
@@ -156,16 +164,56 @@ export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorS
     return out;
 }
 
+/** Empty, all-zero ("00000000000000", "00:00:00:00:00:00") or absent: the NVRs report their serial so. */
+export function realId(s: string | undefined): string | undefined {
+    const t = s?.trim();
+    return t && !/^[0:\-]*$/.test(t) ? t : undefined;
+}
+
+/** The NVR identifiers a channel without one of its own falls back to. */
+export interface NvrIds {
+    /** GetDevInfo serial (all zeros on the NVRs seen so far) */
+    serial?: string;
+    /** Baichuan cmd 114 */
+    uid?: string;
+    /** Baichuan cmd 76 */
+    mac?: string;
+}
+
+/**
+ * Serial number of a channel's camera, first that is real: its UID (kept first: what 0.1.15 showed), its own
+ * serial from Baichuan, else the NVR's serial, UID or MAC with the channel: unique on the NVR, and stable.
+ * Last resort, before the first Baichuan session: the model and the channel. Never all zeros.
+ */
+export function cameraSerialNumber(channel: number, cam: { uid?: string; cameraSerial?: string; model?: string }, nvr: NvrIds): string | undefined {
+    const own = realId(cam.uid) ?? realId(cam.cameraSerial);
+    if (own) return own;
+    const host = realId(nvr.serial) ?? realId(nvr.uid) ?? realId(nvr.mac)?.replace(/[:\-]/g, '').toUpperCase() ?? realId(cam.model);
+    return host ? `${host}-${channel + 1}` : undefined;
+}
+
+/**
+ * Camera serials from Baichuan, without values two channels share: some models report one placeholder serial
+ * for every unit (seen on two Duo 2 cameras), which would make the serial ambiguous.
+ */
+export function distinctSerials(serials: Map<number, string | undefined>): Map<number, string | undefined> {
+    const count = new Map<string, number>();
+    for (const s of serials.values()) if (s) count.set(s, (count.get(s) ?? 0) + 1);
+    return new Map([...serials].map(([ch, s]) => [ch, s && count.get(s) === 1 ? s : undefined]));
+}
+
 /** Channel cache from discovery results. Model follows the stock rule: the channel's typeInfo. */
-export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelStatus | undefined, details: { chnTypeInfo?: any; enc?: any }, ability: Ability | undefined, aiClasses: string[], now = Date.now()): ChannelCache {
+export function channelCacheFrom(channel: number, nvr: DevInfo, status: ChannelStatus | undefined, details: { chnTypeInfo?: any; enc?: any; cameraSerial?: string; nvrIds?: NvrIds }, ability: Ability | undefined, aiClasses: string[], now = Date.now()): ChannelCache {
+    const uid = realId(status?.uid) ?? '';
     return {
         channel,
         name: status?.name,
         online: status ? status.online === 1 : undefined,
         model: details.chnTypeInfo?.typeInfo ?? status?.typeInfo ?? nvr.model,
         firmware: details.chnTypeInfo?.firmVer,
-        // cameras without a UID (some models) get the NVR's serial and their channel: unique, and stable
-        serialNumber: status?.uid || (nvr.serial ? `${nvr.serial}-${channel + 1}` : undefined),
+        serialNumber: cameraSerialNumber(channel, { uid, cameraSerial: details.cameraSerial, model: details.chnTypeInfo?.typeInfo ?? status?.typeInfo }, { ...details.nvrIds, serial: nvr.serial }),
+        uid,
+        cameraSerial: details.cameraSerial,
         exactType: nvr.exactType,
         aiClasses,
         // Keep the shape abilityChn[channel] so the stock ability rules work unchanged.

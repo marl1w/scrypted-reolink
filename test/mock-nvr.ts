@@ -95,6 +95,11 @@ export class MockNvr {
             });
             return this.reply(s, f, this.refuseCommands ? st(400) : ok);
         }
+        if (f.cmd === Cmd.VersionInfo || f.cmd === Cmd.Uid) {
+            if (f.cmd === Cmd.VersionInfo)
+                this.commands.push({ cmd: f.cmd, chId: f.chId, ext: aesDecrypt(this.key, f.body.subarray(0, f.payloadOffset)).toString(), body: aesDecrypt(this.key, f.body.subarray(f.payloadOffset)).toString() });
+            return this.reply(s, f, ok, aesEncrypt(this.key, Buffer.from(fixture(f.cmd === Cmd.Uid ? 'uid.xml' : 'version-info-channel.xml'))));
+        }
         this.reply(s, f, st(400));
     }
 }
