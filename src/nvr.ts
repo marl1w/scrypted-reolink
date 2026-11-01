@@ -12,7 +12,7 @@ import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 import { NvrRecordings } from './recorder';
 import { NvrOutageWatch } from './rebroadcast-watchdog';
-import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
+import { maskCredentials, parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
 /** After an outage, one camera's Rebroadcast is restarted every this long, not all at once. */
@@ -123,7 +123,7 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             uid: ch => this.channelCache(ch)?.uid,
             clipKey: () => this.clipKey(),
             ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
-            log: m => this.console.log(m),
+            log: m => this.console.log(maskCredentials(m, [this.password])),
         });
         const push = new BaichuanClient({ host: this.host, port: Number(this.storageSettings.values.baichuanPort) || 9000, username: this.username, password: this.password });
         this.push = push;

@@ -195,6 +195,19 @@ export function redactUrl(url: string): string {
     catch { return '(unparseable URL)'; }
 }
 
+/**
+ * Credentials masked in a log line, keeping the rest readable: URL userinfo becomes `user:***@`, `password=`/`token=`
+ * values become `***`, a JSON "password" value too, and first the given secrets wherever they appear.
+ */
+export function maskCredentials(s: string, secrets: (string | undefined)[] = []): string {
+    let out = s;
+    for (const sec of secrets) if (sec && sec.length >= 3) out = out.split(sec).join('***');
+    return out
+        .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/'"]*):[^\s@/'"]*@/gi, '$1:***@')
+        .replace(/\b(password|passwd|pwd|token)=[^\s&'"]*/gi, '$1=***')
+        .replace(/("password"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"***"');
+}
+
 /** Credentials as the stock plugin adds them when a stream is opened. */
 export function addStreamCredentials(url: string, username: string, password: string): string {
     const u = new URL(url);

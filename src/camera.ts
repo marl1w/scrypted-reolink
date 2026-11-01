@@ -10,7 +10,7 @@ import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, nightModeNativeId, parse
 import { isNight, MediaLinkKind, recordingStreamFor, RecordingStreamType } from './recordings';
 import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
-import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
+import { addStreamCredentials, buildStreamOptions, chooseSubstream, maskCredentials, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
 import { RebroadcastHangWatch } from './rebroadcast-watchdog';
 
@@ -110,7 +110,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         this.snapshots = new KeyframeCache({
             ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
             source: () => this.snapshotSource(),
-            log: m => this.console.warn(m),
+            log: m => this.console.warn(maskCredentials(m, [this.nvr.password])),
             videoFilter: () => {
                 const v = this.viewCrop();
                 return v && `crop=${v.width}:${v.height}:${v.x}:${v.y}`;
@@ -165,7 +165,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         const now = Date.now();
         if (now - (this.warnedAt.get(key) ?? -Infinity) < WARN_EVERY_MS) return;
         this.warnedAt.set(key, now);
-        this.console.warn(msg);
+        this.console.warn(maskCredentials(msg, [this.nvr.password]));
     }
 
     viewCrop() {

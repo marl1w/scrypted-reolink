@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addStreamCredentials, buildStreamOptions, chooseSubstream, parseSubstreamProtocol, prebufferedStreams, redactUrl, rtspSubstream, substreamOption } from '../src/streams';
+import { addStreamCredentials, buildStreamOptions, chooseSubstream, parseSubstreamProtocol, maskCredentials, prebufferedStreams, redactUrl, rtspSubstream, substreamOption } from '../src/streams';
 
 // Expected values are written out by hand from the stock plugin's
 // ReolinkCamera.getConstructedVideoStreamOptions (@scrypted/reolink 0.0.112) for the same inputs.
@@ -130,4 +130,19 @@ test('stream URLs in logs: no RTSP userinfo, no RTMP query credentials', () => {
     assert.equal(redactUrl('rtsp://viewer:secret@192.0.2.10:554/h264Preview_01_sub'), 'rtsp://192.0.2.10:554/h264Preview_01_sub');
     assert.equal(redactUrl('rtmp://192.0.2.10:1935/bcs/channel0_sub.bcs?channel=0&stream=0&user=viewer&password=a!b#c'), 'rtmp://192.0.2.10:1935/bcs/channel0_sub.bcs');
     assert.equal(redactUrl('not a url'), '(unparseable URL)');
+});
+
+test('log lines: credentials masked, the rest kept', () => {
+    assert.equal(maskCredentials('Sending play command with path: channel6_sub.bcs?channel=6&stream=0&user=viewer&password=s3cret'),
+        'Sending play command with path: channel6_sub.bcs?channel=6&stream=0&user=viewer&password=***');
+    assert.equal(maskCredentials('rtmp://192.0.2.10:1935/bcs/channel0_sub.bcs?channel=0&stream=0&user=viewer&password=a!b#c failed'),
+        'rtmp://192.0.2.10:1935/bcs/channel0_sub.bcs?channel=0&stream=0&user=viewer&password=*** failed');
+    assert.equal(maskCredentials('[tcp @ 0x1] rtsp://viewer:s3cret@192.0.2.10:554/h264Preview_01_sub: Connection refused'),
+        '[tcp @ 0x1] rtsp://viewer:***@192.0.2.10:554/h264Preview_01_sub: Connection refused');
+    assert.equal(maskCredentials('body [{"cmd":"Login","param":{"User":{"userName":"viewer","password":"s3\\"cret"}}}]'),
+        'body [{"cmd":"Login","param":{"User":{"userName":"viewer","password":"***"}}}]');
+    assert.equal(maskCredentials('/api.cgi?cmd=Search&token=abc123 timed out'), '/api.cgi?cmd=Search&token=*** timed out');
+    // a password with & is cut at the & by the pattern; the secret itself is still removed
+    assert.equal(maskCredentials('play ?user=viewer&password=a&b9 end', ['a&b9']), 'play ?user=viewer&password=*** end');
+    assert.equal(maskCredentials('nothing to hide here'), 'nothing to hide here');
 });
