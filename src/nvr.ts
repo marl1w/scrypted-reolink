@@ -11,6 +11,7 @@ import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevi
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 import { NvrRecordings } from './recorder';
+import { NvrOutageWatch } from './rebroadcast-watchdog';
 import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
@@ -76,6 +77,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     /** Native ids announced to Scrypted: no state is written to a child before it exists. */
     private announced = new Set<string>();
     push?: BaichuanClient;
+    /** Restarts every camera's Rebroadcast once the NVR is back after an outage (see rebroadcast-watchdog.ts). */
+    private outageWatch?: NvrOutageWatch;
     private cameras = new Map<string, ReolinkChannelCamera>();
     private lastEventAt?: number;
     private identity?: Promise<boolean>;
@@ -120,9 +123,15 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         });
         const push = new BaichuanClient({ host: this.host, port: Number(this.storageSettings.values.baichuanPort) || 9000, username: this.username, password: this.password });
         this.push = push;
+        const outage = new NvrOutageWatch(ms => {
+            this.console.log(`NVR back after ${Math.round(ms / 1000)} s: restarting the cameras' Rebroadcast sessions`);
+            for (const c of this.cameras.values()) c.restartRebroadcast('the NVR is back after an outage');
+        });
+        this.outageWatch = outage;
         push.on('state', s => {
             this.console.log(`push ${s}`);
             this.online = s === 'subscribed';
+            outage.state(s === 'subscribed');
             if (s !== 'subscribed') for (const c of this.cameras.values()) c.motion.reset();
             else for (const c of this.cameras.values()) c.rawSubscribed();
             this.updateCameraOnline();
@@ -168,6 +177,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
 
     async stop() {
         const p = this.push, s = this.session;
+        this.outageWatch?.dispose();
+        this.outageWatch = undefined;
         this.push = undefined;
         this.session = undefined;
         this._api = undefined;

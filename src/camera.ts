@@ -12,6 +12,7 @@ import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
 import { addStreamCredentials, buildStreamOptions, chooseSubstream, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
+import { RebroadcastHangWatch } from './rebroadcast-watchdog';
 
 const SNAPSHOT_REUSE_MS = 300;
 /** Recording thumbnails are taken at this granularity. */
@@ -313,6 +314,17 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     /** Rebroadcast failures in a row: the retry of a fallback to the NVR grows with them. */
     private rebroadcastFailures = 0;
+    private rebroadcastHang = new RebroadcastHangWatch();
+
+    /**
+     * Makes Rebroadcast drop this camera's sessions and start new ones (a VideoCamera event): a session that hung while
+     * the NVR was away is never restarted by Rebroadcast itself.
+     */
+    restartRebroadcast(reason: string) {
+        this.rebroadcastHang.restarted();
+        this.console.warn(`restarting Rebroadcast: ${reason}`);
+        sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.VideoCamera, undefined);
+    }
 
     /**
      * Prefer Scrypted's local rebroadcast of the substream (the prebuffer already holds the one NVR connection),
@@ -334,12 +346,15 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             const url = String(ff?.url || '');
             if (/^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(url)) {
                 this.rebroadcastFailures = 0;
+                this.rebroadcastHang.ok();
                 return { url, label: 'rebroadcast' };
             }
             reason = `not a local rebroadcast: ${redactUrl(url)}`;
         }
         catch (e) {
             reason = (e as Error).message.replace(/\b[a-z]+:\/\/\S+/gi, redactUrl);
+            if (reason === 'timeout' && this.rebroadcastHang.timedOut(!!this.online))
+                this.restartRebroadcast('it did not answer in time, twice in a row, while the NVR is online');
         }
         finally {
             clearTimeout(timer);
