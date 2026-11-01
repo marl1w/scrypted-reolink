@@ -21,6 +21,8 @@ const SNAPSHOT_WAIT_MS = 1500;
 /** The keyframe cache retries Rebroadcast after reading the NVR for this long, doubling up to the max. */
 const REBROADCAST_RETRY_MS = 60_000;
 const REBROADCAST_RETRY_MAX_MS = 600_000;
+/** After a Rebroadcast restart, the snapshot cache tries Rebroadcast again this soon instead of the backed-off retry. */
+const REBROADCAST_RESTART_RETRY_MS = 15_000;
 /** Caches start within this spread, not all at once (one NVR, many channels). */
 const CACHE_START_SPREAD_MS = 5000;
 /** A repeated warning (substream not prebuffered, cache reading the NVR) is logged at most this often. */
@@ -315,6 +317,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     /** Rebroadcast failures in a row: the retry of a fallback to the NVR grows with them. */
     private rebroadcastFailures = 0;
     private rebroadcastHang = new RebroadcastHangWatch();
+    /** Rebroadcast was just restarted: the next fallback to the NVR is retried soon. */
+    private rebroadcastRestarted = false;
 
     /**
      * Makes Rebroadcast drop this camera's sessions and start new ones (a VideoCamera event): a session that hung while
@@ -322,6 +326,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
      */
     restartRebroadcast(reason: string) {
         this.rebroadcastHang.restarted();
+        this.rebroadcastFailures = 0;
+        this.rebroadcastRestarted = true;
         this.console.warn(`restarting Rebroadcast: ${reason}`);
         sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.VideoCamera, undefined);
     }
@@ -346,6 +352,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             const url = String(ff?.url || '');
             if (/^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(url)) {
                 this.rebroadcastFailures = 0;
+                this.rebroadcastRestarted = false;
                 this.rebroadcastHang.ok();
                 return { url, label: 'rebroadcast' };
             }
@@ -354,12 +361,14 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         catch (e) {
             reason = (e as Error).message.replace(/\b[a-z]+:\/\/\S+/gi, redactUrl);
             if (reason === 'timeout' && this.rebroadcastHang.timedOut(!!this.online))
-                this.restartRebroadcast('it did not answer in time, twice in a row, while the NVR is online');
+                this.restartRebroadcast('it timed out twice in a row while the NVR is online');
         }
         finally {
             clearTimeout(timer);
         }
-        const retryMs = Math.min(REBROADCAST_RETRY_MS * 2 ** this.rebroadcastFailures++, REBROADCAST_RETRY_MAX_MS);
+        const retryMs = this.rebroadcastRestarted ? REBROADCAST_RESTART_RETRY_MS
+            : Math.min(REBROADCAST_RETRY_MS * 2 ** this.rebroadcastFailures++, REBROADCAST_RETRY_MAX_MS);
+        this.rebroadcastRestarted = false;
         this.warnEvery('snapshot-fallback', `snapshot cache: rebroadcast unavailable (${reason}), reading the NVR (${s.id}), next try in ${retryMs / 1000} s`);
         return { url: addStreamCredentials(s.url, this.nvr.username, this.nvr.password), label: 'nvr', retryMs };
     }

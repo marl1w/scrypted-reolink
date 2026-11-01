@@ -15,6 +15,8 @@ import { NvrOutageWatch } from './rebroadcast-watchdog';
 import { parseSubstreamProtocol, SUBSTREAM_PROTOCOLS, SubstreamProtocol } from './streams';
 
 const CACHE_PREFIX = 'chcache:';
+/** After an outage, one camera's Rebroadcast is restarted every this long, not all at once. */
+const RESTART_STAGGER_MS = 3000;
 const NVR_IDS = 'nvrIds';
 /** Smart AI support bits per channel (Baichuan cmd 199 `smartAI`), JSON `{ "<channel>": bits }`. */
 const SMART_AI = 'smartAi';
@@ -79,6 +81,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
     push?: BaichuanClient;
     /** Restarts every camera's Rebroadcast once the NVR is back after an outage (see rebroadcast-watchdog.ts). */
     private outageWatch?: NvrOutageWatch;
+    /** Staggered Rebroadcast restarts still to run after an outage. */
+    private restartTimers: NodeJS.Timeout[] = [];
     private cameras = new Map<string, ReolinkChannelCamera>();
     private lastEventAt?: number;
     private identity?: Promise<boolean>;
@@ -124,8 +128,14 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         const push = new BaichuanClient({ host: this.host, port: Number(this.storageSettings.values.baichuanPort) || 9000, username: this.username, password: this.password });
         this.push = push;
         const outage = new NvrOutageWatch(ms => {
-            this.console.log(`NVR back after ${Math.round(ms / 1000)} s: restarting the cameras' Rebroadcast sessions`);
-            for (const c of this.cameras.values()) c.restartRebroadcast('the NVR is back after an outage');
+            this.console.log(`NVR back after ${Math.round(ms / 1000)} s: restarting the cameras' Rebroadcast sessions, one every ${RESTART_STAGGER_MS / 1000} s`);
+            [...this.cameras.values()].forEach((c, i) => {
+                const t = setTimeout(() => {
+                    this.restartTimers = this.restartTimers.filter(x => x !== t);
+                    c.restartRebroadcast('the NVR is back after an outage');
+                }, i * RESTART_STAGGER_MS);
+                this.restartTimers.push(t);
+            });
         });
         this.outageWatch = outage;
         push.on('state', s => {
@@ -179,6 +189,8 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
         const p = this.push, s = this.session;
         this.outageWatch?.dispose();
         this.outageWatch = undefined;
+        for (const t of this.restartTimers) clearTimeout(t);
+        this.restartTimers = [];
         this.push = undefined;
         this.session = undefined;
         this._api = undefined;
