@@ -146,3 +146,11 @@ test('log lines: credentials masked, the rest kept', () => {
     assert.equal(maskCredentials('play ?user=viewer&password=a&b9 end', ['a&b9']), 'play ?user=viewer&password=*** end');
     assert.equal(maskCredentials('nothing to hide here'), 'nothing to hide here');
 });
+
+test('frame rate: the NVR encoder frameRate as video.fps on the main and sub streams, absent when not reported', () => {
+    const s = buildStreamOptions({ channel: 1, host: H, deviceInfo: nvr, ability: abil(1, 1, 1), enc: { mainStream: { width: 3840, height: 2160, vType: 'h265', frameRate: 15 }, subStream: { width: 896, height: 512, frameRate: 6 } } });
+    const fps = Object.fromEntries(s.map(x => [x.id, x.video.fps]));
+    assert.deepEqual(fps, { 'ext.bcs': undefined, 'sub.bcs': 6, 'h265Preview_02_main': 15, 'h264Preview_02_sub': 6 });
+    const none = buildStreamOptions({ channel: 1, host: H, deviceInfo: nvr, ability: abil(1, 1, 1), enc: { mainStream: { width: 3840, height: 2160, vType: 'h265' }, subStream: { frameRate: 0 } } });
+    assert.ok(none.every(x => !('fps' in x.video)));
+});

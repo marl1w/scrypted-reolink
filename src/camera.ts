@@ -228,7 +228,13 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     private viewOption(): ResponseMediaStreamOptions | undefined {
         const v = this.viewCrop();
-        return v && { id: 'view', name: 'View', container: 'rtsp', video: { codec: 'h264', width: v.width, height: v.height } };
+        return v && { id: 'view', name: 'View', container: 'rtsp', video: { codec: 'h264', width: v.width, height: v.height, ...this.subFps() } };
+    }
+
+    /** `{ fps }` of the channel's substream when the NVR reported it: the View, crops and mirrors are built on it. */
+    subFps(): { fps?: number } {
+        const f = this.nvr.channelCache(this.channel)?.enc?.subStream?.frameRate;
+        return typeof f === 'number' && f > 0 ? { fps: f } : {};
     }
 
     /**
@@ -683,7 +689,7 @@ export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         const c = this.spec();
-        return [{ id: 'crop', name: 'Crop', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height } }];
+        return [{ id: 'crop', name: 'Crop', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height, ...this.camera.subFps() } }];
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
@@ -794,7 +800,7 @@ export class ReolinkMirrorCamera extends ScryptedDeviceBase implements VideoCame
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         const s = this.spec();
         const c = s && parseCrops(this.camera.storageSettings.values.crops).find(x => x.slug === s.source);
-        return [{ id: 'mirror', name: 'Mirror', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height } }];
+        return [{ id: 'mirror', name: 'Mirror', container: 'rtsp', video: { codec: 'h264', width: c?.width, height: c?.height, ...this.camera.subFps() } }];
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {

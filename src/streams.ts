@@ -8,7 +8,7 @@ export interface StreamOption {
     id: string;
     name: string;
     container: 'rtsp' | 'rtmp';
-    video: { codec?: string; width?: number; height?: number };
+    video: { codec?: string; width?: number; height?: number; fps?: number };
     url: string;
 }
 
@@ -78,6 +78,16 @@ export function buildStreamOptions(i: StreamInputs): StreamOption[] {
             s.url = new URL(`rtsp://${rtspAddress}/${s.id}`).toString();
             s.name = `RTSP ${s.id}`;
         }
+    }
+
+    // The encoder's frame rate, where the NVR reports it (not part of stock): consumers that sample frames (a
+    // detector) can then take every frame, or every Nth, instead of resampling to a guessed rate.
+    const fps = (s: { frameRate?: number } | undefined) => typeof s?.frameRate === 'number' && s.frameRate > 0 ? s.frameRate : undefined;
+    const mainFps = fps(i.enc?.mainStream), subFps = fps(i.enc?.subStream);
+    for (const s of streams) {
+        const f = s.id === 'sub.bcs' || s.id === `h264Preview_${channel}_sub` ? subFps
+            : s.id === 'main.bcs' || s.id === `h264Preview_${channel}_main` ? mainFps : undefined;
+        if (f) s.video.fps = f;
     }
 
     const mainStream = i.enc?.mainStream;
