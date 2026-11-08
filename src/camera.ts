@@ -12,7 +12,7 @@ import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
 import { addStreamCredentials, buildStreamOptions, chooseSubstream, maskCredentials, prebufferedStreams, PrebufferView, redactUrl, rtspSubstream, StreamOption } from './streams';
 import type { ReolinkNvr } from './nvr';
-import { RebroadcastHangWatch } from './rebroadcast-watchdog';
+import { DERIVED_PROBE_MS, DERIVED_PROBE_TIMEOUT_MS, DerivedCamera, derivedRestartPlan, RebroadcastHangWatch } from './rebroadcast-watchdog';
 
 const SNAPSHOT_REUSE_MS = 300;
 /** Recording thumbnails are taken at this granularity. */
@@ -117,6 +117,8 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             },
         });
         if (this.storageSettings.values.snapshotCache) this.snapshots.start(Math.random() * CACHE_START_SPREAD_MS);
+        this.derivedProbe = setInterval(() => this.probeDerived(), DERIVED_PROBE_MS);
+        this.derivedProbe.unref?.();
         this.watchSettings();
         // states read from the NVR before this device was created
         const st = nvr.channelStates.get(channel);
@@ -336,6 +338,109 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         this.rebroadcastRestarted = true;
         this.console.warn(`restarting Rebroadcast: ${reason}`);
         sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.VideoCamera, undefined);
+        this.restartDerivedAfter(this.nativeId!);
+    }
+
+    /** Pending restarts of crops and mirrors, by native id. */
+    private derivedTimers = new Map<string, NodeJS.Timeout>();
+    /** Per crop and mirror: its Rebroadcast failed twice in a row while its source answered. */
+    private derivedHang = new Map<string, RebroadcastHangWatch>();
+    /** Crops and mirrors whose last probe answered. */
+    private derivedOk = new Set<string>();
+    private derivedProbe?: NodeJS.Timeout;
+    private derivedProbing = false;
+
+    /** This camera's crops and mirrors, as configured. */
+    derivedCameras(): DerivedCamera[] {
+        const crops = parseCrops(this.storageSettings.values.crops);
+        return [
+            ...crops.map(c => ({ nativeId: cropNativeId(this.nativeId!, c.slug), kind: 'crop' as const, streamId: 'crop' })),
+            ...parseMirrors(this.storageSettings.values.mirrors, crops).map(m => ({
+                nativeId: mirrorNativeId(this.nativeId!, m.slug), kind: 'mirror' as const, streamId: 'mirror', source: cropNativeId(this.nativeId!, m.source),
+            })),
+        ];
+    }
+
+    private hangWatch(nativeId: string) {
+        let w = this.derivedHang.get(nativeId);
+        if (!w) this.derivedHang.set(nativeId, w = new RebroadcastHangWatch());
+        return w;
+    }
+
+    /**
+     * The crops read this camera's rebroadcast and the mirrors read a crop's: once `restarted` (this camera or one of
+     * its crops) has new sessions, the cameras reading it get theirs, or they keep waiting on the input that went away.
+     */
+    private restartDerivedAfter(restarted: string) {
+        for (const { nativeId, delayMs } of derivedRestartPlan(restarted, this.nativeId!, this.derivedCameras())) {
+            clearTimeout(this.derivedTimers.get(nativeId));
+            const t = setTimeout(() => {
+                this.derivedTimers.delete(nativeId);
+                this.restartDerived(nativeId, `its source ${restarted === this.nativeId ? this.name : restarted} was restarted`);
+            }, delayMs);
+            t.unref?.();
+            this.derivedTimers.set(nativeId, t);
+        }
+    }
+
+    private restartDerived(nativeId: string, reason: string) {
+        this.hangWatch(nativeId).restarted();
+        this.derivedOk.delete(nativeId);
+        this.console.warn(`restarting Rebroadcast of ${nativeId}: ${reason}`);
+        sdk.deviceManager.onDeviceEvent(nativeId, ScryptedInterface.VideoCamera, undefined);
+        this.restartDerivedAfter(nativeId);
+    }
+
+    /**
+     * Asks every crop and mirror for its stream through its mixins, as HomeKit and the recorders do. One that does not
+     * answer (or errors) twice in a row while its source answers is restarted (at most once per interval, so a broken source cannot
+     * make it loop). A crop's source is this camera, online and with its own Rebroadcast answering; a mirror's is its crop.
+     */
+    async probeDerived() {
+        if (this.derivedProbing) return;
+        this.derivedProbing = true;
+        try {
+            const sourceOk = !!this.online && this.rebroadcastFailures === 0;
+            for (const c of this.derivedCameras()) {
+                const upstream = c.kind === 'crop' ? sourceOk : sourceOk && this.derivedOk.has(c.source!);
+                const answer = upstream ? await this.probeStream(c) : 'skipped';
+                if (answer === 'ok') {
+                    this.derivedOk.add(c.nativeId);
+                    this.hangWatch(c.nativeId).ok();
+                    continue;
+                }
+                this.derivedOk.delete(c.nativeId);
+                if (answer === 'failed' && this.hangWatch(c.nativeId).timedOut(upstream))
+                    this.restartDerived(c.nativeId, 'its stream failed twice in a row while its source answered');
+                else if (answer === 'skipped')
+                    this.hangWatch(c.nativeId).timedOut(false);
+            }
+        }
+        finally {
+            this.derivedProbing = false;
+        }
+    }
+
+    private async probeStream(c: DerivedCamera): Promise<'ok' | 'failed' | 'skipped'> {
+        const dev = await this.announcedChild<ScryptedDeviceBase>(c.nativeId);
+        if (!dev?.id) return 'skipped';
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            const cam = sdk.systemManager.getDeviceById<VideoCamera>(dev.id);
+            const mo = await Promise.race([
+                cam.getVideoStream({ id: c.streamId, prebuffer: 0, destination: 'local' } as RequestMediaStreamOptions),
+                new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), DERIVED_PROBE_TIMEOUT_MS); }),
+            ]);
+            const ff = await sdk.mediaManager.convertMediaObjectToJSON<any>(mo, ScryptedMimeTypes.FFmpegInput);
+            return /^rtsp:\/\/(127\.0\.0\.1|localhost)[:/]/.test(String(ff?.url || '')) ? 'ok' : 'failed';
+        }
+        catch {
+            // no answer in time, or an error: either way no frames reach HomeKit or the recorders
+            return 'failed';
+        }
+        finally {
+            clearTimeout(timer);
+        }
     }
 
     /**
@@ -597,6 +702,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         for (const d of this.children.values()) (d as ReolinkMirrorCamera).dispose?.();
         this.motion.dispose();
         this.snapshots.stop();
+        clearInterval(this.derivedProbe);
+        for (const t of this.derivedTimers.values()) clearTimeout(t);
+        this.derivedTimers.clear();
         clearTimeout(this.settingsTimer);
         this.settingsListener?.removeListener();
         this.settingsListener = undefined;

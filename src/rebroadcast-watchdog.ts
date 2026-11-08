@@ -72,3 +72,30 @@ export class RebroadcastHangWatch {
         this.lastRestart = Date.now();
     }
 }
+
+// Crops and mirrors. A crop camera's Rebroadcast reads its parent's rebroadcast (through Scrypted, not the NVR) and a
+// mirror's reads its crop's. When the parent's session is restarted the input of the crop's session goes away under
+// it, and that session can hang exactly like the parent's did: the NVR watch never sees it (the crop has no NVR
+// connection of its own), so before this the crop and its mirror stayed without frames until Scrypted restarted.
+// Seen on 2026-11-08 after the NVRs' weekly 02:00 restart, the first one after the outage restarts were added.
+
+/** A crop is restarted this long after its parent, a mirror twice as long, so each one's source is up again first. */
+export const DERIVED_RESTART_DELAY_MS = 15_000;
+/** Every crop and mirror is asked for its stream this often, so a session that hung for any reason is found. */
+export const DERIVED_PROBE_MS = 60_000;
+/** ...and given this long to answer. */
+export const DERIVED_PROBE_TIMEOUT_MS = 10_000;
+
+/** A camera derived from a channel's substream: a crop reads the parent, a mirror reads the crop `source`. */
+export interface DerivedCamera { nativeId: string; kind: 'crop' | 'mirror'; streamId: string; source?: string }
+
+/** Which derived cameras to restart, and when, after `restarted` (the parent's native id, or a crop's). */
+export function derivedRestartPlan(restarted: string, parent: string, cameras: DerivedCamera[]): { nativeId: string; delayMs: number }[] {
+    if (restarted === parent) {
+        return [
+            ...cameras.filter(c => c.kind === 'crop').map(c => ({ nativeId: c.nativeId, delayMs: DERIVED_RESTART_DELAY_MS })),
+            ...cameras.filter(c => c.kind === 'mirror').map(c => ({ nativeId: c.nativeId, delayMs: 2 * DERIVED_RESTART_DELAY_MS })),
+        ];
+    }
+    return cameras.filter(c => c.kind === 'mirror' && c.source === restarted).map(c => ({ nativeId: c.nativeId, delayMs: DERIVED_RESTART_DELAY_MS }));
+}
