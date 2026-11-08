@@ -7,7 +7,7 @@ import { formatEvent, parseFloodlightStatus, parseSirenStatus, PushEvent } from 
 import { parseDayNightState, parseMac, parseRecordEnable, parseSmartAiSupport, parseUid, parseVersionInfo, smartAiClasses } from './baichuan/info';
 import { Frame } from './baichuan/frame';
 import { ReolinkChannelCamera } from './camera';
-import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, cameraSerialNumber, ChannelCache, channelCacheFrom, distinctSerials, formatHealth, NvrIds, parseCameraNativeId, parseCrops, parseMirrors, realId } from './devices';
+import { buildCameraDevice, buildChildDevices, buildCropDevices, buildMirrorDevices, cameraNativeId, childNativeId, cameraSerialNumber, ChannelCache, channelCacheFrom, distinctSerials, formatHealth, NvrIds, parseCameraNativeId, parseCrops, parseMirrors, realId } from './devices';
 import { discoveredChannels, NvrApi, supportedAiClasses } from './http/nvr-api';
 import { HttpSession } from './http/session';
 import { NvrRecordings } from './recorder';
@@ -379,6 +379,10 @@ export class ReolinkNvr extends ScryptedDeviceBase implements DeviceProvider, Se
             await sdk.deviceManager.onDevicesChanged({ providerNativeId: camId, devices: children as any });
             for (const m of mirrors.mirrors)
                 await sdk.deviceManager.onDevicesChanged({ providerNativeId: m.nativeId, devices: mirrors.children.filter(c => c.providerNativeId === m.nativeId) as any });
+            // a crop has no children: one that was a mirror before (same id, other role) loses its presence children,
+            // which are named like Coral Guard's presence sensors on the crop and would be followed by its mirror instead
+            for (const c of crops)
+                await sdk.deviceManager.onDevicesChanged({ providerNativeId: childNativeId(camId, c.id), devices: [] });
             for (const a of [...this.announced]) if (a.startsWith(`${camId}-`)) this.announced.delete(a);
             for (const d of [{ nativeId: camId }, ...children, ...mirrors.children]) this.announced.add(d.nativeId);
         }

@@ -125,6 +125,34 @@ test('a start keeps the siren, floodlight and class children while the abilities
     }
 });
 
+test('a crop that was a mirror before loses the mirror\'s presence children (its children are announced empty)', async () => {
+    changed.length = 0;
+    announced.clear();
+    const dm = sdkStub.default.deviceManager as any;
+    const orig = dm.getDeviceStorage;
+    dm.getDeviceStorage = (id: string) => id === 'nvr-3-ch0'
+        ? { getItem: (k: string) => k === 'crops' ? JSON.stringify(['villa_1_postiauto=928:576:0:0 @mirror-villa-1-postiauto']) : k === 'mirrors' ? JSON.stringify(['villa_2_postiauto=villa_1_postiauto @crop-villa-2-postiauto']) : null }
+        : undefined;
+    const m = new MockNvr();
+    await m.start();
+    seed = { host: '127.0.0.1', username: m.user, password: m.password, baichuanPort: m.port, httpPort: 9, channels: ['0'] };
+    const nvr = new ReolinkNvr('nvr-3');
+    try {
+        for (let i = 0; i < 200 && !changed.some(c => c.providerNativeId === 'nvr-3-ch0-mirror-villa-1-postiauto'); i++) await new Promise(r => setTimeout(r, 25));
+        const crop = changed.find(c => c.providerNativeId === 'nvr-3-ch0-mirror-villa-1-postiauto');
+        assert.ok(crop, 'the crop (on its old mirror id) gets its children announced');
+        assert.deepEqual(crop!.devices, [], '...as none');
+        const mirror = changed.find(c => c.providerNativeId === 'nvr-3-ch0-crop-villa-2-postiauto')!;
+        assert.deepEqual(mirror.devices.map(d => d.nativeId), ['nvr-3-ch0-crop-villa-2-postiauto-vehicle', 'nvr-3-ch0-crop-villa-2-postiauto-animal']);
+    }
+    finally {
+        dm.getDeviceStorage = orig;
+        seed = {};
+        await nvr.stop();
+        await m.stop();
+    }
+});
+
 test('a floodlight the NVR reports off is no longer kept on (no re-light behind everyone\'s back)', async (t) => {
     const { ReolinkFloodlight } = require('../src/camera');
     t.mock.timers.enable({ apis: ['setInterval'] });
