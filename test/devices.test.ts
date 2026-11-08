@@ -95,7 +95,7 @@ test('view crop: width:height:x:y or the whole frame', () => {
 test('mirror cameras follow a configured crop and get presence children', () => {
     const crops = parseCrops(['home_b_drive (Baichuan)=928:576:0:0']);
     const m = parseMirrors(['home_a_drive=home_b_drive (Baichuan)', 'Other=missing', 'bad', 'home_b_drive (Baichuan)=home_b_drive (Baichuan)'], crops);
-    assert.deepEqual(m, [{ slug: 'home-a-drive', name: 'home_a_drive', source: 'home-b-drive-baichuan' }]);
+    assert.deepEqual(m, [{ slug: 'home-a-drive', name: 'home_a_drive', id: 'mirror-home-a-drive', source: 'home-b-drive-baichuan', sourceId: 'crop-home-b-drive-baichuan' }]);
     const d = buildMirrorDevices('nvr-1-ch8', m);
     assert.deepEqual(d.mirrors.map(x => [x.nativeId, x.providerNativeId, x.type]), [['nvr-1-ch8-mirror-home-a-drive', 'nvr-1-ch8', 'Camera']]);
     assert.deepEqual(d.children.map(x => [x.nativeId, x.providerNativeId, x.name]), [
@@ -114,6 +114,49 @@ test('crop and mirror serials: source serial and a short tag, no names', () => {
     assert.match(m.mirrors[0].info!.serialNumber!, /^141400000000001-mirror-[0-9a-f]{6}$/);
     assert.notEqual(slugTag('parking-spot'), slugTag('gate'));
     assert.equal(buildCropDevices('nvr-1-ch8', crops).at(0)?.info?.serialNumber, undefined);
+});
+
+test('without an @id the ids are what they always were', () => {
+    const crops = parseCrops(['villa_2_postiauto (Baichuan)=928:576:0:0']);
+    assert.equal(crops[0].id, 'crop-villa-2-postiauto-baichuan');
+    assert.equal(parseMirrors(['villa_1_postiauto=villa_2_postiauto (Baichuan)'], crops)[0].id, 'mirror-villa-1-postiauto');
+});
+
+test('@id keeps a device\'s id and serial while it is renamed and changes role (crop <-> mirror swap)', () => {
+    const serial = '9527000KTGU910D6';
+    // before: villa_2 is the crop, villa_1 its mirror
+    const before = parseCrops(['villa_2_postiauto (Baichuan)=928:576:0:0']);
+    const beforeCrop = buildCropDevices('nvr-1-ch8', before, serial)[0];
+    const beforeMirror = buildMirrorDevices('nvr-1-ch8', parseMirrors(['villa_1_postiauto=villa_2_postiauto (Baichuan)'], before), serial).mirrors[0];
+    // after: villa_1 is the crop, villa_2 its mirror, each on the id it had
+    const crops = parseCrops([
+        'villa_1_ingresso=928:576:608:0',
+        'villa_1_postiauto=928:576:0:0 @mirror-villa-1-postiauto',
+    ]);
+    const mirrors = parseMirrors(['villa_2_postiauto=villa_1_postiauto @crop-villa-2-postiauto-baichuan'], crops);
+    const crop = buildCropDevices('nvr-1-ch8', crops, serial);
+    const mirror = buildMirrorDevices('nvr-1-ch8', mirrors, serial);
+    assert.deepEqual(crop.map(d => [d.nativeId, d.name]), [
+        ['nvr-1-ch8-crop-villa-1-ingresso', 'villa_1_ingresso'],
+        [beforeMirror.nativeId, 'villa_1_postiauto'],
+    ]);
+    assert.equal(crop[1].info?.serialNumber, beforeMirror.info?.serialNumber, 'same serial as before');
+    assert.deepEqual(mirror.mirrors.map(d => [d.nativeId, d.name]), [[beforeCrop.nativeId, 'villa_2_postiauto']]);
+    assert.equal(mirror.mirrors[0].info?.serialNumber, beforeCrop.info?.serialNumber, 'same serial as before');
+    assert.equal(mirrors[0].sourceId, 'mirror-villa-1-postiauto', 'the mirror reads the crop through its kept id');
+    assert.deepEqual(mirror.children.map(d => d.nativeId), [`${beforeCrop.nativeId}-vehicle`, `${beforeCrop.nativeId}-animal`]);
+});
+
+test('@id: invalid ids and ids already taken are skipped', () => {
+    const crops = parseCrops(['a=1:1:0:0 @nope', 'b=1:1:0:0 @crop-x', 'c=1:1:0:0 @crop-x', 'd=1:1:0:0 @Crop-Y']);
+    assert.deepEqual(crops.map(c => [c.name, c.id]), [['b', 'crop-x']]);
+    assert.deepEqual(parseMirrors(['m=b @crop-x', 'n=b @mirror-n', 'o=b @mirror-n'], crops).map(m => [m.name, m.id]), [['n', 'mirror-n']]);
+});
+
+test('crops take the parent\'s motion and AI as their trigger', () => {
+    const [crop] = buildCropDevices('nvr-1-ch8', parseCrops(['Gate=320:240:0:0']));
+    assert.ok(crop.interfaces.includes('MotionSensor'));
+    assert.ok(crop.interfaces.includes('ObjectDetector'));
 });
 
 test('a Camera <class> child per supported AI class, named as the MQTT add-on names its entities', () => {

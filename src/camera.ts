@@ -6,7 +6,7 @@ import { rawEntities, reolinkMqtt } from './mqtt';
 import type { PushEvent } from './baichuan/events';
 import { MotionController, MotionTrigger } from './motion';
 import { KeyframeCache } from './snapshot-cache';
-import { cropNativeId, MIRROR_PRESENCE, mirrorNativeId, nightModeNativeId, parseCrops, parseMirrors, parseViewCrop, rawClasses, rawClassNativeId, rawMotionNativeId } from './devices';
+import { childNativeId, MIRROR_PRESENCE, nightModeNativeId, parseCrops, parseMirrors, parseViewCrop, rawClasses, rawClassNativeId, rawMotionNativeId } from './devices';
 import { isNight, MediaLinkKind, recordingStreamFor, RecordingStreamType } from './recordings';
 import { linkExpiry, mediaLink } from './media-http';
 import type { NvrRecordings, RecordingInput } from './recorder';
@@ -57,7 +57,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         },
         crops: {
             title: 'Crop Cameras',
-            description: 'Extra cameras cut from this one: Name=width:height:x:y in substream pixels. The crop itself is the Rebroadcast output prefix of the crop camera (-vf crop=...); the crop camera reads this camera through Scrypted, adding no NVR connection.',
+            description: 'Extra cameras cut from this one: Name=width:height:x:y in substream pixels. The crop itself is the Rebroadcast output prefix of the crop camera (-vf crop=...); the crop camera reads this camera through Scrypted, adding no NVR connection. Each crop takes this camera\'s motion and AI detections as its trigger (Reolink reports no coordinates; Coral Guard on the crop verifies them). A trailing " @<id>" (crop-... or mirror-...) keeps an existing device\'s id, so it keeps its HomeKit pairing and its Home Assistant device when renamed or changing role.',
             multiple: true,
             combobox: true,
             defaultValue: [],
@@ -70,7 +70,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
         },
         mirrors: {
             title: 'Mirror Cameras',
-            description: 'Name=<crop camera name>: the same stream, motion and presence as that crop camera, as another accessory (a HomeKit accessory pairs into one Home only). Nothing is encoded or analysed twice.',
+            description: 'Name=<crop camera name>: the same stream, motion and presence as that crop camera, as another accessory (a HomeKit accessory pairs into one Home only). Nothing is encoded or analysed twice. A trailing " @<id>" keeps an existing device\'s id, as for crops.',
             multiple: true,
             combobox: true,
             defaultValue: [],
@@ -95,7 +95,10 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
             trigger: this.storageSettings.values.motionTrigger as MotionTrigger,
             repeatMs: 1000,
         }), {
-            setMotion: on => { this.motionDetected = on; },
+            setMotion: on => {
+                this.motionDetected = on;
+                this.forCrops(c => { if (c.motionDetected !== on) c.motionDetected = on; });
+            },
             detections: classes => {
                 const od: ObjectsDetected = {
                     timestamp: Date.now(),
@@ -103,6 +106,7 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
                     sourceId: this.pluginId,
                 };
                 sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, od);
+                this.forCrops(c => sdk.deviceManager.onDeviceEvent(c.nativeId, ScryptedInterface.ObjectDetector, od));
             },
             dayNight: mode => this.nightModeState(mode),
             raw: (motion, classes) => this.publishRaw(motion, classes),
@@ -148,6 +152,20 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     applyChildStates() {
         if (this.dayNightKnown !== undefined) this.nightModeState(this.dayNightKnown);
         if (this.rawKnown) this.publishRaw(this.rawLast.motion, this.rawLast.classes);
+        const on = this.motionDetected;
+        this.forCrops(c => { if (c.motionDetected !== on) c.motionDetected = on; });
+    }
+
+    /**
+     * Runs `fn` on every announced crop. Crops take this camera's motion and AI detections as their trigger: Reolink
+     * reports no coordinates, so it cannot say which crop the subject is in, and Coral Guard on each crop decides that.
+     */
+    private forCrops(fn: (c: ReolinkCropCamera) => void) {
+        for (const spec of parseCrops(this.storageSettings.values.crops)) {
+            this.announcedChild<ReolinkCropCamera>(childNativeId(this.nativeId!, spec.id)).then(c => {
+                if (c instanceof ReolinkCropCamera) fn(c);
+            }).catch(() => { /* not announced yet */ });
+        }
     }
 
     /** Whether the NVR records this channel (cmd 81 `enable`). */
@@ -354,9 +372,9 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
     derivedCameras(): DerivedCamera[] {
         const crops = parseCrops(this.storageSettings.values.crops);
         return [
-            ...crops.map(c => ({ nativeId: cropNativeId(this.nativeId!, c.slug), kind: 'crop' as const, streamId: 'crop' })),
+            ...crops.map(c => ({ nativeId: childNativeId(this.nativeId!, c.id), kind: 'crop' as const, streamId: 'crop' })),
             ...parseMirrors(this.storageSettings.values.mirrors, crops).map(m => ({
-                nativeId: mirrorNativeId(this.nativeId!, m.slug), kind: 'mirror' as const, streamId: 'mirror', source: cropNativeId(this.nativeId!, m.source),
+                nativeId: childNativeId(this.nativeId!, m.id), kind: 'mirror' as const, streamId: 'mirror', source: childNativeId(this.nativeId!, m.sourceId),
             })),
         ];
     }
@@ -680,9 +698,17 @@ export class ReolinkChannelCamera extends ScryptedDeviceBase implements VideoCam
 
     async getDevice(nativeId: string): Promise<any> {
         let d = this.children.get(nativeId);
+        // a crop or mirror whose role changed in the settings is built again in its new role
+        const role = this.derivedCameras().find(c => c.nativeId === nativeId)?.kind;
+        if ((d instanceof ReolinkCropCamera && role !== 'crop') || (d instanceof ReolinkMirrorCamera && role !== 'mirror')) {
+            (d as ReolinkMirrorCamera).dispose?.();
+            this.children.delete(nativeId);
+            d = undefined;
+        }
         if (!d) {
-            if (nativeId.includes('-mirror-')) d = new ReolinkMirrorCamera(nativeId, this);
-            else if (nativeId.includes('-crop-')) d = new ReolinkCropCamera(nativeId, this);
+            // the role comes from the configured lists, not from the id: a device can keep its id while changing role
+            if (role === 'mirror') d = new ReolinkMirrorCamera(nativeId, this);
+            else if (role === 'crop') d = new ReolinkCropCamera(nativeId, this);
             else if (nativeId.endsWith('-siren')) d = new ReolinkSiren(nativeId, this);
             else if (nativeId.endsWith('-floodlight')) d = new ReolinkFloodlight(nativeId, this);
             else if (nativeId === nightModeNativeId(this.nativeId!)) d = new ReolinkNightMode(nativeId);
@@ -786,13 +812,22 @@ export class ReolinkFloodlight extends ScryptedDeviceBase implements OnOff {
 /**
  * A camera cut from its parent camera. It reads the parent through Scrypted (the parent's prebuffer, via its
  * mixins), so it adds no NVR connection and no fixed rebroadcast URL; the crop filter is the Rebroadcast
- * output prefix of this device. Sensorless: it has no motion of its own.
+ * output prefix of this device. Its motion and AI detections are the parent's, as the trigger: Reolink reports no
+ * coordinates, so whether the subject is in this crop is for Coral Guard on the crop to verify.
  */
-export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera, Settings {
+export class ReolinkCropCamera extends ScryptedDeviceBase implements VideoCamera, MotionSensor, ObjectDetector, Settings {
     constructor(nativeId: string, readonly camera: ReolinkChannelCamera) { super(nativeId); }
 
+    async getObjectTypes(): Promise<ObjectDetectionTypes> {
+        return this.camera.getObjectTypes();
+    }
+
+    async getDetectionInput(): Promise<MediaObject> {
+        throw new Error('detection input not available');
+    }
+
     private spec() {
-        return parseCrops(this.camera.storageSettings.values.crops).find(c => cropNativeId(this.camera.nativeId!, c.slug) === this.nativeId);
+        return parseCrops(this.camera.storageSettings.values.crops).find(c => childNativeId(this.camera.nativeId!, c.id) === this.nativeId);
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
@@ -841,13 +876,13 @@ export class ReolinkMirrorCamera extends ScryptedDeviceBase implements VideoCame
 
     private spec() {
         const crops = parseCrops(this.camera.storageSettings.values.crops);
-        return parseMirrors(this.camera.storageSettings.values.mirrors, crops).find(m => mirrorNativeId(this.camera.nativeId!, m.slug) === this.nativeId);
+        return parseMirrors(this.camera.storageSettings.values.mirrors, crops).find(m => childNativeId(this.camera.nativeId!, m.id) === this.nativeId);
     }
 
     private async source() {
         const s = this.spec();
         if (!s) throw new Error('not configured on the parent');
-        const crop = await this.camera.getDevice(cropNativeId(this.camera.nativeId!, s.source)) as ScryptedDeviceBase | undefined;
+        const crop = await this.camera.getDevice(childNativeId(this.camera.nativeId!, s.sourceId)) as ScryptedDeviceBase | undefined;
         const dev = crop?.id && sdk.systemManager.getDeviceById<ScryptedDevice & VideoCamera & Camera & MotionSensor & OccupancySensor & ObjectDetector>(crop.id);
         if (!dev) throw new Error(`crop camera ${s.source} not found`);
         return dev;

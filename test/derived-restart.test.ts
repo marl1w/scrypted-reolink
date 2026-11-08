@@ -12,6 +12,7 @@ const MIRROR = `${PARENT}-mirror-posti-auto-v2`;
 
 // --- SDK stand-in: records VideoCamera events, serves each device's stream as the test says ---
 const events: string[] = [];
+const detected: [string, string[]][] = [];
 /** How a device's stream request answers: a local rebroadcast url, an error, or never. */
 const streams = new Map<string, 'ok' | 'error' | 'hang'>();
 const announced = new Set<string>();
@@ -28,7 +29,10 @@ const sdkStub = {
     default: {
         deviceManager: {
             getNativeIds: () => [...announced],
-            onDeviceEvent(nativeId: string, iface: string) { if (iface === 'VideoCamera') events.push(nativeId); },
+            onDeviceEvent(nativeId: string, iface: string, data?: any) {
+                if (iface === 'VideoCamera') events.push(nativeId);
+                if (iface === 'ObjectDetector') detected.push([nativeId, data?.detections?.map((d: any) => d.className)]);
+            },
             getDeviceStorage() { return undefined; },
             onDevicesChanged: async () => { },
         },
@@ -194,4 +198,38 @@ test('a crop that keeps failing is restarted at most once per interval, never in
     streams.set('crop-id', 'error');
     for (let i = 0; i < 10; i++) await probe(cam);
     assert.equal(events.filter(e => e === CROP).length, 1);
+});
+
+test('roles come from the configured lists: a crop and a mirror can swap roles and keep their ids', async t => {
+    const cam = await camera(t);
+    const { ReolinkCropCamera, ReolinkMirrorCamera } = require('../src/camera');
+    // the mirror's id becomes the crop, the crop's id becomes the mirror
+    cam.storageSettings.values.crops = ['villa_1_postiauto=928:576:0:0 @mirror-posti-auto-v2'];
+    cam.storageSettings.values.mirrors = ['villa_2_postiauto=villa_1_postiauto @crop-posti-auto'];
+    // no release in between: the cached objects are rebuilt in their new roles
+    assert.ok(await cam.getDevice(MIRROR) instanceof ReolinkCropCamera, 'id ...-mirror-... is now the crop');
+    assert.ok(await cam.getDevice(CROP) instanceof ReolinkMirrorCamera, 'id ...-crop-... is now the mirror');
+    // restarts follow the roles too: the crop first, then the mirror that reads it
+    cam.restartRebroadcast('test');
+    mock.timers.tick(DERIVED_RESTART_DELAY_MS);
+    assert.deepEqual(events, [PARENT, MIRROR]);
+    mock.timers.tick(DERIVED_RESTART_DELAY_MS);
+    assert.deepEqual(events, [PARENT, MIRROR, CROP]);
+});
+
+test('crops take the parent\'s motion and AI detections as their trigger; mirrors follow their crop, not the parent', async t => {
+    const cam = await camera(t);
+    const crop = await cam.getDevice(CROP);
+    const mirror = await cam.getDevice(MIRROR);
+    detected.length = 0;
+    cam.onPush({ kind: 'alarm', channel: 8, motion: true, ai: new Set(['people']), status: ['MD'] });
+    await flush();
+    assert.equal(cam.motionDetected, true);
+    assert.equal(crop.motionDetected, true, 'the crop is triggered with its parent');
+    assert.ok(detected.some(([id, c]) => id === CROP && c.includes('people')), 'the crop gets the parent\'s detections');
+    assert.ok(!detected.some(([id]) => id === MIRROR), 'the mirror gets nothing from the parent directly');
+    assert.notEqual(mirror.motionDetected, true, 'the mirror repeats its crop as Coral Guard gates it, not the raw trigger');
+    cam.motion.reset();
+    await flush();
+    assert.equal(crop.motionDetected, cam.motionDetected, 'reset reaches the crop too');
 });

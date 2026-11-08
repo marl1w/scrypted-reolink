@@ -110,83 +110,115 @@ export function buildChildDevices(cameraNativeIdValue: string, cameraName: strin
     return out;
 }
 
-export interface CropSpec { slug: string; name: string; width: number; height: number; x: number; y: number }
+/**
+ * `id` is the child's native id after the camera's (`<camera>-<id>`): by default `crop-<slug>` or `mirror-<slug>`.
+ * An entry can keep an existing device's id with a trailing ` @<id>` (`crop-...` or `mirror-...`), so a device
+ * keeps its Scrypted id - and with it its HomeKit pairing and its Home Assistant device - when it is renamed or
+ * changes role: the role is the entry's list, never the id.
+ */
+export interface CropSpec { slug: string; name: string; id: string; width: number; height: number; x: number; y: number }
+
+const slugOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const CHILD_ID = /^(?:crop|mirror)-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/** `<rest> @<id>`: the entry without the id, and the id when it is a valid one (an invalid one skips the entry). */
+function splitId(entry: string): { rest: string; id?: string; bad?: boolean } {
+    const m = /^(.*?)\s+@(\S+)\s*$/.exec(entry);
+    if (!m) return { rest: entry };
+    return CHILD_ID.test(m[2]) ? { rest: m[1], id: m[2] } : { rest: m[1], bad: true };
+}
 
 /**
- * Crop cameras configured on a camera, one per entry `Name=width:height:x:y` (pixels of the substream).
- * Invalid entries are skipped.
+ * Crop cameras configured on a camera, one per entry `Name=width:height:x:y` (pixels of the substream), optionally
+ * followed by ` @<id>`. Invalid entries, repeated names and repeated ids are skipped.
  */
 export function parseCrops(entries: unknown): CropSpec[] {
     const out: CropSpec[] = [];
     for (const e of Array.isArray(entries) ? entries : []) {
-        const m = /^\s*([^=]+?)\s*=\s*(\d+):(\d+):(\d+):(\d+)\s*$/.exec(String(e));
+        const { rest, id: given, bad } = splitId(String(e));
+        if (bad) continue;
+        const m = /^\s*([^=]+?)\s*=\s*(\d+):(\d+):(\d+):(\d+)\s*$/.exec(rest);
         if (!m) continue;
         const name = m[1];
-        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-        if (!slug || out.some(c => c.slug === slug)) continue;
-        out.push({ slug, name, width: +m[2], height: +m[3], x: +m[4], y: +m[5] });
+        const slug = slugOf(name);
+        const id = given ?? `crop-${slug}`;
+        if (!slug || out.some(c => c.slug === slug || c.id === id)) continue;
+        out.push({ slug, name, id, width: +m[2], height: +m[3], x: +m[4], y: +m[5] });
     }
     return out;
 }
 
-export const cropNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-crop-${slug}`;
+/** A crop's or mirror's native id: `<camera>-<id>`. */
+export const childNativeId = (cameraNativeIdValue: string, id: string) => `${cameraNativeIdValue}-${id}`;
 
 /** A short stable tag for a crop or mirror serial: the slug embeds user-chosen names. */
 export const slugTag = (slug: string) => createHash('sha1').update(slug).digest('hex').slice(0, 6);
 
+/** `<camera serial>-crop-<tag>` / `-mirror-<tag>` from the id, so a device that keeps its id keeps its serial too. */
+function childSerial(serialNumber: string | undefined, id: string): string | undefined {
+    const m = /^(crop|mirror)-(.+)$/.exec(id);
+    return serialNumber && m ? `${serialNumber}-${m[1]}-${slugTag(m[2])}` : undefined;
+}
+
+/**
+ * Crops have no coordinates of their own to tell where the camera saw motion (Reolink AI reports className and
+ * score only), so each crop takes its parent's raw motion and AI detections as its trigger, and Coral Guard on the
+ * crop verifies whether the subject is in the crop's picture.
+ */
 export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[], serialNumber?: string): DeviceManifest[] {
     return crops.map(c => ({
-        nativeId: cropNativeId(cameraNativeIdValue, c.slug),
+        nativeId: childNativeId(cameraNativeIdValue, c.id),
         providerNativeId: cameraNativeIdValue,
         name: c.name,
         type: 'Camera',
-        interfaces: ['VideoCamera', 'Settings'],
-        info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-crop-${slugTag(c.slug)}` },
+        interfaces: ['VideoCamera', 'MotionSensor', 'ObjectDetector', 'Settings'],
+        info: { manufacturer: 'Reolink', serialNumber: childSerial(serialNumber, c.id) },
     }));
 }
 
 /** The camera's own view: `width:height:x:y` in substream pixels, or undefined for the whole frame. */
-export function parseViewCrop(value: unknown): Omit<CropSpec, 'slug' | 'name'> | undefined {
+export function parseViewCrop(value: unknown): Omit<CropSpec, 'slug' | 'name' | 'id'> | undefined {
     const m = /^\s*(\d+):(\d+):(\d+):(\d+)\s*$/.exec(String(value ?? ''));
     return m ? { width: +m[1], height: +m[2], x: +m[3], y: +m[4] } : undefined;
 }
 
-export interface MirrorSpec { slug: string; name: string; source: string }
+/** `source` is the crop's slug, `sourceId` its id. */
+export interface MirrorSpec { slug: string; name: string; id: string; source: string; sourceId: string }
 
 /**
- * Mirror cameras, one per entry `Name=<crop name>`: the same stream, motion and presence as one of this
- * camera's crops, as a second accessory (a HomeKit accessory pairs into one Home only). Entries naming no
- * configured crop are skipped.
+ * Mirror cameras, one per entry `Name=<crop name>`, optionally followed by ` @<id>`: the same stream, motion and
+ * presence as one of this camera's crops, as a second accessory (a HomeKit accessory pairs into one Home only).
+ * Entries naming no configured crop, and names or ids a crop or another mirror already has, are skipped.
  */
 export function parseMirrors(entries: unknown, crops: CropSpec[]): MirrorSpec[] {
-    const slugOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const out: MirrorSpec[] = [];
     for (const e of Array.isArray(entries) ? entries : []) {
-        const m = /^\s*([^=]+?)\s*=\s*(.+?)\s*$/.exec(String(e));
+        const { rest, id: given, bad } = splitId(String(e));
+        if (bad) continue;
+        const m = /^\s*([^=]+?)\s*=\s*(.+?)\s*$/.exec(rest);
         if (!m) continue;
         const slug = slugOf(m[1]);
+        const id = given ?? `mirror-${slug}`;
         const source = crops.find(c => c.slug === slugOf(m[2]));
-        if (!slug || !source || out.some(x => x.slug === slug) || crops.some(c => c.slug === slug)) continue;
-        out.push({ slug, name: m[1], source: source.slug });
+        if (!slug || !source || out.some(x => x.slug === slug || x.id === id) || crops.some(c => c.slug === slug || c.id === id)) continue;
+        out.push({ slug, name: m[1], id, source: source.slug, sourceId: source.id });
     }
     return out;
 }
-
-export const mirrorNativeId = (cameraNativeIdValue: string, slug: string) => `${cameraNativeIdValue}-mirror-${slug}`;
 
 export const MIRROR_PRESENCE = ['Vehicle', 'Animal'] as const;
 
 export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorSpec[], serialNumber?: string): { mirrors: DeviceManifest[]; children: DeviceManifest[] } {
     const out = { mirrors: [] as DeviceManifest[], children: [] as DeviceManifest[] };
     for (const m of mirrors) {
-        const nativeId = mirrorNativeId(cameraNativeIdValue, m.slug);
+        const nativeId = childNativeId(cameraNativeIdValue, m.id);
         out.mirrors.push({
             nativeId,
             providerNativeId: cameraNativeIdValue,
             name: m.name,
             type: 'Camera',
             interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector', 'Settings', 'DeviceProvider'],
-            info: { manufacturer: 'Reolink', serialNumber: serialNumber && `${serialNumber}-mirror-${slugTag(m.slug)}` },
+            info: { manufacturer: 'Reolink', serialNumber: childSerial(serialNumber, m.id) },
         });
         // Named "<camera> Vehicle Presence" so the patched HomeKit plugin puts them inside the camera tile.
         for (const g of MIRROR_PRESENCE)
