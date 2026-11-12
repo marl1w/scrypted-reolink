@@ -183,3 +183,14 @@ test('children of fields not read yet are kept as announced; read fields decide'
     const known = buildChildDevices('nvr-1-ch0', 'Cam A', { channel: 0, ability: { abilityChn: [{}] }, aiClasses: [] }, existing);
     assert.deepEqual(known.map(d => d.nativeId), ['nvr-1-ch0-nightmode', 'nvr-1-ch0-rawmotion'], 'read: removed');
 });
+
+test('crops and mirrors announce their role as the model, whatever id they kept', () => {
+    // a mirror on the id it had as a crop, a crop on the id it had as a mirror (entries ending in " @<id>")
+    const crops = parseCrops(['Spot A=928:576:0:0 @mirror-spot-a']);
+    const [crop] = buildCropDevices('nvr-1-ch8', crops);
+    const { mirrors: [mirror] } = buildMirrorDevices('nvr-1-ch8', parseMirrors(['Spot B=Spot A @crop-spot-b'], crops));
+    assert.match(crop.nativeId, /-mirror-/);
+    assert.equal(crop.info?.model, 'Crop');
+    assert.match(mirror.nativeId, /-crop-/);
+    assert.equal(mirror.info?.model, 'Mirror');
+});

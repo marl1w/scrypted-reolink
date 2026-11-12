@@ -161,6 +161,12 @@ function childSerial(serialNumber: string | undefined, id: string): string | und
 }
 
 /**
+ * The role of a derived camera, announced as its `info.model`. Its native id cannot tell: an entry ending in ` @<id>`
+ * keeps the id the device had in its earlier role (a mirror on `crop-...`, a crop on `mirror-...`).
+ */
+export const DERIVED_MODEL = { crop: 'Crop', mirror: 'Mirror' } as const;
+
+/**
  * Crops have no coordinates of their own to tell where the camera saw motion (Reolink AI reports className and
  * score only), so each crop takes its parent's raw motion and AI detections as its trigger, and Coral Guard on the
  * crop verifies whether the subject is in the crop's picture.
@@ -172,7 +178,8 @@ export function buildCropDevices(cameraNativeIdValue: string, crops: CropSpec[],
         name: c.name,
         type: 'Camera',
         interfaces: ['VideoCamera', 'MotionSensor', 'ObjectDetector', 'Settings'],
-        info: { manufacturer: 'Reolink', serialNumber: childSerial(serialNumber, c.id) },
+        // the role, for consumers: the native id keeps the id a device had before it changed role (crop-... as a mirror)
+        info: { manufacturer: 'Reolink', model: DERIVED_MODEL.crop, serialNumber: childSerial(serialNumber, c.id) },
     }));
 }
 
@@ -218,7 +225,7 @@ export function buildMirrorDevices(cameraNativeIdValue: string, mirrors: MirrorS
             name: m.name,
             type: 'Camera',
             interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector', 'Settings', 'DeviceProvider'],
-            info: { manufacturer: 'Reolink', serialNumber: childSerial(serialNumber, m.id) },
+            info: { manufacturer: 'Reolink', model: DERIVED_MODEL.mirror, serialNumber: childSerial(serialNumber, m.id) },
         });
         // Named "<camera> Vehicle Presence" so the patched HomeKit plugin puts them inside the camera tile.
         for (const g of MIRROR_PRESENCE)
